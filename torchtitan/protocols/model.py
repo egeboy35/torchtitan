@@ -141,7 +141,6 @@ class BaseModel(Module, ABC):
         compile_config: CompileConfig | None,
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
-        skip_dp: bool = False,
     ) -> Self:
         """Apply the ordered model-level parallelization lifecycle."""
         with parallelism_context.activate_spmd():
@@ -156,12 +155,11 @@ class BaseModel(Module, ABC):
                     compile_config=compile_config,
                     parallelism_context=parallelism_context,
                 )
-            if not skip_dp:
-                self._apply_fsdp(
-                    parallelism_context=parallelism_context,
-                    training=training,
-                    parallelism=parallelism,
-                )
+            self._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
         return self
 
     @abstractmethod

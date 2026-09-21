@@ -408,7 +408,6 @@ class KimiK3Model(MultimodalModel):
         compile_config: CompileConfig | None,
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
-        skip_dp: bool = False,
     ) -> KimiK3Model:
         if parallelism_context.cp_enabled:
             raise NotImplementedError(
@@ -425,12 +424,11 @@ class KimiK3Model(MultimodalModel):
                 policy.apply(self)
                 if self.vision_encoder is not None:
                     policy.apply(self.vision_encoder)
-            if not skip_dp:
-                self._apply_fsdp(
-                    parallelism_context=parallelism_context,
-                    training=training,
-                    parallelism=parallelism,
-                )
+            self._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
         return self
 
     def preprocess_inputs(

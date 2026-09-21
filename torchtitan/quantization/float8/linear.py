@@ -17,6 +17,7 @@ from torch.autograd.function import once_differentiable
 
 from torchao.float8.float8_ops import addmm_float8_unwrapped
 
+from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.linear import Linear
 
 from .._fsdp_tensor import _UnshardedFSDPTensor
@@ -319,6 +320,25 @@ class Float8Linear(Linear):
             wrapper_cls(self.weight.data),
             requires_grad=self.weight.requires_grad,
         )
+
+    def _parallelize(self, parallelism_context: ParallelismContext) -> None:
+        # spmd_types returns a plain tensor when TP shards the weight. Restore
+        # the FSDP extension wrapper before fully_shard() consumes it.
+        super()._parallelize(parallelism_context)
+        wrapper_cls = (
+            _LinearShardedTensorWithFloat8HighPrecisionWeightGradient
+            if self.recipe_name == "rowwise_with_gw_hp"
+            else _LinearShardedTensorWithFloat8Compute
+        )
+        if isinstance(self.weight, wrapper_cls):
+            return
+        distributed_weight = self.weight
+        wrapped_weight = nn.Parameter(
+            wrapper_cls(distributed_weight.data),
+            requires_grad=distributed_weight.requires_grad,
+        )
+        spmd.assert_type_like(wrapped_weight, distributed_weight)
+        self.weight = wrapped_weight
 
     def _linear(
         self,

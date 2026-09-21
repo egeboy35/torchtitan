@@ -39,7 +39,6 @@ class MultimodalModel(Decoder):
         compile_config: CompileConfig | None,
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
-        skip_dp: bool = False,
     ) -> Self:
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
@@ -69,12 +68,11 @@ class MultimodalModel(Decoder):
                         parallelism_context=parallelism_context,
                     )
 
-            if not skip_dp:
-                self._apply_fsdp(
-                    parallelism_context=parallelism_context,
-                    training=training,
-                    parallelism=parallelism,
-                )
+            self._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
         return self
 
     def _apply_fsdp(

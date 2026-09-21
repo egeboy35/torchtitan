@@ -195,7 +195,6 @@ class FluxModel(BaseModel):
         compile_config: CompileConfig | None,
         ac_config: ActivationCheckpointingConfig | None,
         dump_folder: str,
-        skip_dp: bool = False,
     ) -> Self:
         """Apply Flux's AC-before-SPMD parallelization lifecycle."""
         with parallelism_context.activate_spmd():
@@ -218,12 +217,11 @@ class FluxModel(BaseModel):
                 for block in (*self.double_blocks, *self.single_blocks):
                     block.compile(backend=compile_config.backend, fullgraph=True)
 
-            if not skip_dp:
-                self._apply_fsdp(
-                    parallelism_context=parallelism_context,
-                    training=training,
-                    parallelism=parallelism,
-                )
+            self._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
         return self
 
     def _apply_fsdp(
