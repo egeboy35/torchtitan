@@ -250,6 +250,10 @@ class InterGeneratorRouter(Actor, Configurable):
                     generator=h, cache_policy_version=h.policy_version
                 )
                 self._group_routes[routing_group_id] = group_route
+            # Reuse the salt that stored the KV this request can hit: its own
+            # session's on the session generator, the group's for a new
+            # sibling. A rerouted session has no KV at the destination, so
+            # None makes the destination salt with its own version.
             selected_cache_policy_version = (
                 session.cache_policy_version
                 if session is not None and h is session.generator

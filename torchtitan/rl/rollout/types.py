@@ -39,6 +39,7 @@ class GenerateFn(Protocol):
         *,
         request_id: str,
         routing_session_id: str | None = None,
+        routing_group_id: int | None = None,
         sampling_config: SamplingConfig | None = None,
     ) -> Completion | None:
         """Run one generation.
@@ -49,6 +50,9 @@ class GenerateFn(Protocol):
             routing_session_id: Optional stable key for the routing session this call
                 belongs to. A router may use it for session affinity, routing same-key
                 calls to the same generator when possible. `None` means no affinity.
+            routing_group_id: Optional id of the rollout group this call belongs to. A
+                router may use it to share state across the group's calls, such as a
+                prefix-cache namespace. `None` means the call belongs to no group.
             sampling_config: Optional per-call sampling overrides.
 
         Returns:

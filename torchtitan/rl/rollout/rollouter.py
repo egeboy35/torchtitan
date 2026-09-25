@@ -411,6 +411,7 @@ class RolloutWorker(Configurable):
                     request_id=turn_rollout_id.to_string(),
                     # Per-sample sticky key: a sample's turns reuse one generator's prefix cache.
                     routing_session_id=turn_rollout_id.to_string(include_turn=False),
+                    routing_group_id=group_id,
                     sampling_config=sampling,
                 )
 

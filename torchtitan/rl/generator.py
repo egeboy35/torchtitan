@@ -1186,7 +1186,31 @@ class VLLMGenerator(Configurable):
                         self._request_dispatcher._dp_rank
                     ]
                     if local_requests:
-                        self._admit_requests(local_requests)
+                        # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
+                        # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
+                        # cache_salt is the request's group version, or this generator's installed version
+                        # for a rerouted rollout that carries none.
+                        engine_inputs = self._engine.renderer.render_cmpl(
+                            [
+                                {
+                                    "prompt_token_ids": request.prompt_token_ids,
+                                    "cache_salt": str(
+                                        self.policy_version
+                                        if request.cache_policy_version is None
+                                        else request.cache_policy_version
+                                    ),
+                                }
+                                for request in local_requests
+                            ]
+                        )
+                        for request, engine_input in zip(
+                            local_requests, engine_inputs, strict=True
+                        ):
+                            self._engine.add_request(
+                                request_id=request.request_id,
+                                prompt=engine_input,
+                                params=self._build_sampling_params(request.sampling),
+                            )
 
                 # Barrier (NCCL): engine.step() runs SPMD in lockstep.
                 # The step burst `max_engine_steps_between_decisions` gives the generator time to buffer
@@ -1275,30 +1299,6 @@ class VLLMGenerator(Configurable):
             #   (start_token, version) boundaries; today we keep only the per-turn min/max.
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
-
-    def _admit_requests(self, requests: list[GenerationRequest]) -> None:
-        """Render queued requests and add them to the local vLLM engine."""
-        # render_cmpl is vLLM's input pipeline. Tokenization is a no-op for
-        # tokenized prompts, and the typed input carries cache_salt to vLLM.
-        engine_inputs = self._engine.renderer.render_cmpl(
-            [
-                {
-                    "prompt_token_ids": request.prompt_token_ids,
-                    "cache_salt": str(
-                        self.policy_version
-                        if request.cache_policy_version is None
-                        else request.cache_policy_version
-                    ),
-                }
-                for request in requests
-            ]
-        )
-        for request, engine_input in zip(requests, engine_inputs, strict=True):
-            self._engine.add_request(
-                request_id=request.request_id,
-                prompt=engine_input,
-                params=self._build_sampling_params(request.sampling),
-            )
 
     @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:

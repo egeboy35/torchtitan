@@ -31,6 +31,8 @@ from torchtitan.rl.generator import (
     _prepare_generation_request_metrics,
     GenerationFuture,
     GenerationRequest,
+    LoopAction,
+    LoopDecision,
     RequestDispatcher,
     SamplingConfig,
     VLLMCudaGraphConfig,
@@ -67,6 +69,9 @@ class _FakeEngine:
 
     def add_request(self, *args, **kwargs):
         self.add_requests.append((args, kwargs))
+
+    def has_unfinished_requests(self):
+        return False
 
     def reset_prefix_cache(self, *args, **kwargs):
         self.reset_prefix_cache_calls.append((args, kwargs))
@@ -237,8 +242,35 @@ def test_build_sampling_params_seed_and_stop_default_to_none():
     assert not params.stop_token_ids  # vLLM normalizes None -> []
 
 
+def _admit_through_engine_loop(monkeypatch, generator, requests):
+    """Run the engine loop for one STEP decision that admits ``requests``, then CLOSE."""
+    decisions = iter(
+        [
+            LoopDecision(action=LoopAction.STEP, requests_per_dp_rank=[requests]),
+            LoopDecision(action=LoopAction.CLOSE),
+        ]
+    )
+
+    async def decide_next_action():
+        return next(decisions)
+
+    generator._decide_next_action = decide_next_action
+    generator._request_dispatcher = SimpleNamespace(
+        setup=lambda: None,
+        rank0_stamp_min_policy_version=lambda *args: None,
+        _dp_rank=0,
+    )
+    generator.config.max_engine_steps_between_decisions = 1
+    # A single rank already holds rank 0's decision.
+    generator._broadcast_group = None
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *args, **kwargs: None)
+    asyncio.run(generator._engine_loop())
+
+
 @pytest.mark.parametrize("cache_policy_version", [None, 6])
-def test_admit_requests_uses_local_version_for_new_rollouts(cache_policy_version):
+def test_admission_uses_local_version_for_new_rollouts(
+    monkeypatch, cache_policy_version
+):
     generator = _generator()
     engine = cast(_FakeEngine, generator._engine)
     request = GenerationRequest(
@@ -249,7 +281,7 @@ def test_admit_requests_uses_local_version_for_new_rollouts(cache_policy_version
         cache_policy_version=cache_policy_version,
     )
 
-    generator._admit_requests([request])
+    _admit_through_engine_loop(monkeypatch, generator, [request])
 
     _, kwargs = engine.add_requests[0]
     assert kwargs["prompt"]["cache_salt"] == (
@@ -257,7 +289,7 @@ def test_admit_requests_uses_local_version_for_new_rollouts(cache_policy_version
     )
 
 
-def test_new_request_uses_version_installed_after_queueing():
+def test_new_request_uses_version_installed_after_queueing(monkeypatch):
     generator = _generator()
     engine = cast(_FakeEngine, generator._engine)
     request = GenerationRequest(
@@ -269,7 +301,7 @@ def test_new_request_uses_version_installed_after_queueing():
     )
 
     generator.policy_version = 8
-    generator._admit_requests([request])
+    _admit_through_engine_loop(monkeypatch, generator, [request])
 
     assert engine.add_requests[0][1]["prompt"]["cache_salt"] == "8"
 

@@ -34,7 +34,7 @@ from torchtitan.rl.types import (
 )
 
 
-def test_generate_fn_identifies_group_for_router() -> None:
+def test_generate_fn_forwards_group_id_to_router() -> None:
     class _GenerateEndpoint:
         def __init__(self) -> None:
             self.calls = []
@@ -53,24 +53,29 @@ def test_generate_fn_identifies_group_for_router() -> None:
         controller = Controller.__new__(Controller)
         endpoint = _GenerateEndpoint()
         controller.generator_router = type("Router", (), {"generate": endpoint})()
-        generate = controller._make_generate_fn("generator", group_id=3)
-        generate_next = controller._make_generate_fn("generator", group_id=4)
+        # One GenerateFn serves every group; each call names its own group.
+        generate = controller._make_generate_fn("generator")
 
         await generate(
             [1, 2],
             request_id="group=3/rollout=0/turn=1",
             routing_session_id="group=3/rollout=0",
+            routing_group_id=3,
         )
         await generate(
             [1, 2, 3],
             request_id="group=3/rollout=0/turn=2",
             routing_session_id="group=3/rollout=0",
+            routing_group_id=3,
         )
-        await generate_next(
+        await generate(
             [4, 5],
             request_id="group=4/rollout=0/turn=0",
             routing_session_id="group=4/rollout=0",
+            routing_group_id=4,
         )
+        with pytest.raises(AssertionError, match="rollout group id"):
+            await generate([6], request_id="no-group", routing_session_id="s")
 
         assert [kwargs["routing_group_id"] for _, kwargs in endpoint.calls] == [
             3,
@@ -107,6 +112,7 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
                 [1, 2],
                 request_id=f"group={group_id}/rollout=0/turn=0",
                 routing_session_id=f"group={group_id}/rollout=0",
+                routing_group_id=group_id,
             )
             if fail_group:
                 raise RuntimeError("rollout failed")
@@ -124,19 +130,19 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
         if fail_group:
             with pytest.raises(RuntimeError, match="rollout failed"):
                 await controller._run_group_rollouts(
+                    generate_fn=controller._make_generate_fn("generator"),
                     sample=object(),
                     group_id=3,
                     group_size=1,
                     sampling=object(),
-                    metrics_prefix="generator",
                 )
         else:
             await controller._run_group_rollouts(
+                generate_fn=controller._make_generate_fn("generator"),
                 sample=object(),
                 group_id=3,
                 group_size=1,
                 sampling=object(),
-                metrics_prefix="generator",
             )
         assert finish_endpoint.calls == [3]
 

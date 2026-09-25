@@ -15,6 +15,7 @@ from aiohttp import ClientSession
 
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
+    GROUP_KEY_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.examples.verifiers.rollouter import (
@@ -125,6 +126,7 @@ def test_generation_server_forwards_token_request() -> None:
             *,
             request_id,
             routing_session_id=None,
+            routing_group_id=None,
             sampling_config=None,
         ):
             received.append(
@@ -146,42 +148,45 @@ def test_generation_server_forwards_token_request() -> None:
             )
 
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
-        server.set_generate_fn(generate_fn)
         await server.start()
         try:
-            async with ClientSession() as session:
-                response = await session.get(f"{server.base_url}/models")
-                assert response.status == 200
-                assert await response.json() == {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "torchtitan",
-                            "object": "model",
-                            "created": 0,
-                            "owned_by": "torchtitan",
-                            "max_model_len": 40960,
-                        }
-                    ],
-                }
-                for _ in range(2):
-                    response = await session.post(
-                        f"http://{server.host}:{server.port}/inference/v1/generate",
-                        headers={"X-Session-ID": "group=1/rollout=2"},
-                        json={
-                            "token_ids": [10, 11],
-                            "sampling_params": {
-                                "temperature": 1.0,
-                                "top_p": 0.9,
-                                "max_tokens": 2,
-                                "seed": 4,
-                                "logprobs": 1,
-                            },
-                        },
-                    )
+            with server.serve_group(generate_fn, group_id=1) as group_key:
+                async with ClientSession() as session:
+                    response = await session.get(f"{server.base_url}/models")
                     assert response.status == 200
-                    payload = await response.json()
-            generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
+                    assert await response.json() == {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "torchtitan",
+                                "object": "model",
+                                "created": 0,
+                                "owned_by": "torchtitan",
+                                "max_model_len": 40960,
+                            }
+                        ],
+                    }
+                    for _ in range(2):
+                        response = await session.post(
+                            f"http://{server.host}:{server.port}/inference/v1/generate",
+                            headers={"X-Session-ID": "group=1/rollout=2"},
+                            json={
+                                "token_ids": [10, 11],
+                                "sampling_params": {
+                                    "temperature": 1.0,
+                                    "top_p": 0.9,
+                                    "max_tokens": 2,
+                                    "seed": 4,
+                                    "logprobs": 1,
+                                    GROUP_KEY_SAMPLING_PARAM: group_key,
+                                },
+                            },
+                        )
+                        assert response.status == 200
+                        payload = await response.json()
+                generation_metadata = server.pop_generation_metadata(
+                    "group=1/rollout=2"
+                )
         finally:
             await server.close()
 
@@ -209,6 +214,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
             *,
             request_id,
             routing_session_id=None,
+            routing_group_id=None,
             sampling_config=None,
         ):
             return Completion(
@@ -221,18 +227,23 @@ def test_generation_server_rejects_aborted_generation() -> None:
             )
 
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
-        server.set_generate_fn(generate_fn)
         await server.start()
         try:
-            async with ClientSession() as session:
-                response = await session.post(
-                    f"http://{server.host}:{server.port}/inference/v1/generate",
-                    headers={"X-Session-ID": "group=1/rollout=2"},
-                    json={"token_ids": [10, 11], "sampling_params": {}},
+            with server.serve_group(generate_fn, group_id=1) as group_key:
+                async with ClientSession() as session:
+                    response = await session.post(
+                        f"http://{server.host}:{server.port}/inference/v1/generate",
+                        headers={"X-Session-ID": "group=1/rollout=2"},
+                        json={
+                            "token_ids": [10, 11],
+                            "sampling_params": {GROUP_KEY_SAMPLING_PARAM: group_key},
+                        },
+                    )
+                    assert response.status == 502
+                    payload = await response.json()
+                generation_metadata = server.pop_generation_metadata(
+                    "group=1/rollout=2"
                 )
-                assert response.status == 502
-                payload = await response.json()
-            generation_metadata = server.pop_generation_metadata("group=1/rollout=2")
         finally:
             await server.close()
 
@@ -240,5 +251,66 @@ def test_generation_server_rejects_aborted_generation() -> None:
             "error": "generation finished without a usable completion: abort"
         }
         assert generation_metadata is None
+
+    asyncio.run(run_test())
+
+
+def test_generation_server_forwards_each_request_with_its_group_id() -> None:
+    async def run_test() -> None:
+        received: list[tuple[int, str]] = []
+
+        async def generate_fn(
+            prompt_token_ids,
+            *,
+            request_id,
+            routing_session_id=None,
+            routing_group_id=None,
+            sampling_config=None,
+        ):
+            received.append((routing_group_id, routing_session_id))
+            return Completion(
+                min_policy_version=1,
+                max_policy_version=1,
+                request_id=request_id,
+                token_ids=[31],
+                token_logprobs=[-0.1],
+                finish_reason="stop",
+            )
+
+        async def post(session, key: str, session_id: str):
+            return await session.post(
+                f"http://{server.host}:{server.port}/inference/v1/generate",
+                headers={"X-Session-ID": session_id},
+                json={
+                    "token_ids": [10],
+                    "sampling_params": {GROUP_KEY_SAMPLING_PARAM: key},
+                },
+            )
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        await server.start()
+        try:
+            async with ClientSession() as session:
+                with server.serve_group(generate_fn, group_id=3) as key_3:
+                    # Group 4 registers after group 3, as a later concurrent group would.
+                    with server.serve_group(generate_fn, group_id=4) as key_4:
+                        assert (await post(session, key_3, "trace-a")).status == 200
+                        assert (await post(session, key_4, "trace-b")).status == 200
+                    response = await post(session, key_4, "trace-b")
+                    assert response.status == 409
+                    assert (await post(session, key_3, "trace-a")).status == 200
+                response = await post(session, "missing", "trace-a")
+                assert response.status == 409
+                response = await session.post(
+                    f"http://{server.host}:{server.port}/inference/v1/generate",
+                    headers={"X-Session-ID": "trace-a"},
+                    json={"token_ids": [10], "sampling_params": {}},
+                )
+                assert response.status == 400
+        finally:
+            await server.close()
+
+        assert received == [(3, "trace-a"), (4, "trace-b"), (3, "trace-a")]
+        assert server.groups == {}
 
     asyncio.run(run_test())
