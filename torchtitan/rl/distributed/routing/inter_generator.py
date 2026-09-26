@@ -220,20 +220,22 @@ class InterGeneratorRouter(Actor, Configurable):
         cache version from where the call lands.
         """
         session_id = routing_ctx.session_id if pin_session else None
-        session = self._sessions.get(session_id) if session_id is not None else None
-        group_namespace = (
-            self._group_namespaces.get(routing_group_id)
-            if pin_session and routing_group_id is not None
-            else None
-        )
-        if session is not None:
-            min_version = session.max_policy_version
-        elif group_namespace is not None:
-            min_version = group_namespace.cache_policy_version
-        else:
-            min_version = None
         while True:
             await self._serving.wait()
+            # Read the routing state after every wait: while this call waited, a
+            # sibling may have pinned the group's namespace.
+            session = self._sessions.get(session_id) if session_id is not None else None
+            group_namespace = (
+                self._group_namespaces.get(routing_group_id)
+                if pin_session and routing_group_id is not None
+                else None
+            )
+            if session is not None:
+                min_version = session.max_policy_version
+            elif group_namespace is not None:
+                min_version = group_namespace.cache_policy_version
+            else:
+                min_version = None
             eligible = [
                 h
                 for h in self._candidates()

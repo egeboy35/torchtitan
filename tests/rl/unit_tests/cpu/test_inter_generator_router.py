@@ -247,6 +247,43 @@ def test_new_sibling_waits_for_group_version_if_original_generator_unavailable()
     asyncio.run(run())
 
 
+def test_sibling_that_waited_uses_group_namespace_pinned_meanwhile():
+    async def run():
+        actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
+        router = _sticky_router(actors)
+        await router._pull_model_state_dict(policy_version=7)
+        for h in router._generators:
+            router._set_state(h, _GeneratorState.SYNCING)
+        actors[0].generate.release.clear()
+
+        # Both siblings arrive while no generator is serving, so both wait.
+        first = asyncio.create_task(
+            _generate(router, session_id="group=0/rollout=0", turn=0)
+        )
+        second = asyncio.create_task(
+            _generate(router, session_id="group=0/rollout=1", turn=0)
+        )
+        await asyncio.sleep(0)
+        actors[0].policy_version = 8
+        router._generators[0].policy_version = 8
+        router._set_state(router._generators[0], _GeneratorState.SERVING)
+        router._set_state(router._generators[1], _GeneratorState.SERVING)
+        await actors[0].generate.started.wait()
+        await asyncio.sleep(0)
+
+        # The first sibling pinned the group at gen0/v8 while the second waited.
+        # The second must not land on the older, less-loaded gen1 or re-pin the group.
+        assert [
+            call[1]["cache_policy_version"] for call in actors[0].generate.calls
+        ] == [8, 8]
+        assert not actors[1].generate.calls
+        assert router._group_namespaces[0].generator is router._generators[0]
+        actors[0].generate.release.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run())
+
+
 def test_reused_validation_session_starts_with_new_group_salt():
     async def run():
         actor = _VersionedActor("gen0")
