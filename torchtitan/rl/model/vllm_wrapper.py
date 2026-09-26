@@ -444,7 +444,7 @@ class VLLMModelWrapper(Module):
 
             # Pass through transformer layers
             for layer in self.model.layers.values():
-                h = layer(h, attention_masks=None, positions=positions)
+                h = layer(h, attention_metadata=None, positions=positions)
 
             h = self.model.norm(h)
         # Inference disables sequence parallelism, so final hidden states should
