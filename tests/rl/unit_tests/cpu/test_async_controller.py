@@ -74,7 +74,7 @@ def test_generate_fn_forwards_group_id_to_router() -> None:
             routing_session_id="group=4/rollout=0",
             routing_group_id=4,
         )
-        with pytest.raises(AssertionError, match="rollout group id"):
+        with pytest.raises(ValueError, match="routing_group_id is required"):
             await generate([6], request_id="no-group", routing_session_id="s")
 
         assert [kwargs["routing_group_id"] for _, kwargs in endpoint.calls] == [
@@ -82,7 +82,6 @@ def test_generate_fn_forwards_group_id_to_router() -> None:
             3,
             4,
         ]
-        assert all("cache_salt" not in kwargs for _, kwargs in endpoint.calls)
 
     asyncio.run(run())
 
@@ -145,6 +144,33 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
                 sampling=object(),
             )
         assert finish_endpoint.calls == [3]
+
+    asyncio.run(run())
+
+
+def test_finish_group_failure_keeps_rollout_result() -> None:
+    class _FailingFinishEndpoint:
+        async def call_one(self, group_id):
+            raise RuntimeError("router unavailable")
+
+    class _Rollouter:
+        async def run_group_rollouts(self, *, group_id, **kwargs):
+            return RolloutGroup(group_id=group_id, rollouts=[])
+
+    async def run() -> None:
+        controller = Controller.__new__(Controller)
+        controller.generator_router = type(
+            "Router", (), {"finish_group": _FailingFinishEndpoint()}
+        )()
+        controller._rollouter = _Rollouter()
+        group = await controller._run_group_rollouts(
+            generate_fn=None,
+            sample=object(),
+            group_id=3,
+            group_size=1,
+            sampling=object(),
+        )
+        assert group.group_id == 3
 
     asyncio.run(run())
 

@@ -35,8 +35,13 @@ each rollout group tags its requests with the key from ``serve_group``.
 
 @dataclass(frozen=True, slots=True)
 class _RegisteredGroup:
+    """A rollout group served by this server, looked up by its request key."""
+
     generate_fn: GenerateFn
+    """Generation entry point for the group, e.g. for training or validation."""
+
     group_id: int
+    """Rollout group id forwarded to ``generate_fn`` as ``routing_group_id``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +135,8 @@ class GenerationServer(Configurable):
         try:
             yield key
         finally:
-            del self.groups[key]
+            # close() may have cleared the registry already.
+            self.groups.pop(key, None)
 
     async def start(self) -> None:
         if self.runner is not None:

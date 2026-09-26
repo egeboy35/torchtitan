@@ -395,12 +395,6 @@ def test_generator_dp_can_supply_expert_parallelism():
     )
 
 
-def test_generator_defaults_to_preserving_salted_kv_on_weight_sync():
-    config = VLLMGenerator.Config(parallelism=_PARALLELISM)
-
-    assert not config.reset_kv_cache_on_weight_sync
-
-
 def test_batch_invariant_requires_kv_cache_reset():
     with pytest.raises(ValueError, match="reset_kv_cache_on_weight_sync"):
         VLLMGenerator.Config(

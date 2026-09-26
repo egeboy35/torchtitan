@@ -255,6 +255,21 @@ def test_generation_server_rejects_aborted_generation() -> None:
     asyncio.run(run_test())
 
 
+def test_generation_server_close_during_group_does_not_raise() -> None:
+    async def run_test() -> None:
+        async def generate_fn(prompt_token_ids, **kwargs):
+            raise AssertionError("not called")
+
+        server = GenerationServer.Config(max_rollout_tokens=40960).build()
+        await server.start()
+        # Shutdown can clear the registry while a group is still being served.
+        with server.serve_group(generate_fn, group_id=3):
+            await server.close()
+        assert server.groups == {}
+
+    asyncio.run(run_test())
+
+
 def test_generation_server_forwards_each_request_with_its_group_id() -> None:
     async def run_test() -> None:
         received: list[tuple[int, str]] = []

@@ -480,9 +480,11 @@ class Controller(Configurable):
             routing_group_id: int | None = None,
             sampling_config: SamplingConfig | None = None,
         ) -> Completion | None:
-            assert (
-                routing_group_id is not None
-            ), "the generator router needs the rollout group id"
+            if routing_group_id is None:
+                raise ValueError(
+                    "routing_group_id is required: the generator router keeps a rollout "
+                    "group's calls in one cache namespace"
+                )
             return await generator_router.generate.call_one(
                 prompt_token_ids,
                 request_id=request_id,
@@ -513,7 +515,13 @@ class Controller(Configurable):
                 sampling=sampling,
             )
         finally:
-            await self.generator_router.finish_group.call_one(group_id)
+            # A cleanup failure must not replace the rollouts' result or exception.
+            try:
+                await self.generator_router.finish_group.call_one(group_id)
+            except Exception:
+                logger.exception(
+                    f"failed to release routing state for rollout group {group_id}"
+                )
 
     @sl.log_trace_span("setup_async")
     async def setup_async(
