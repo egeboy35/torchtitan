@@ -17,7 +17,7 @@ _data_input_loop                                      _rollout_loop[N] (group wo
 +--------------------------------------------------+  +--------------------------------------------------+
 | group_buffer.wait_for_slot()                     |  | work = group_buffer.claim_next()                  |
 | sample = rollouter.get_training_sample()         |  | group = rollouter.run_group_rollouts(work.sample) |
-| work = RolloutGroupWork(group_id, sample)         | | group_buffer.finalize_work(group)                 |
+| work = RolloutGroupWork(group_id, sample)        |  | group_buffer.finalize_work(group)                 |
 | group_buffer.add_work(work)                      |  +-----------------------+--------------------------+
 +-----------------------+--------------------------+                          ^ |
                         |                                                     | |
@@ -831,10 +831,7 @@ class Controller(Configurable):
 
         # data_input_loop
         data_input_task = asyncio.create_task(
-            self._data_input_loop(
-                self._group_buffer,
-            ),
-            name="data_input",
+            self._data_input_loop(self._group_buffer), name="data_input"
         )
 
         # training_sample_batcher_loop
@@ -909,10 +906,7 @@ class Controller(Configurable):
             )
         logger.info("=" * 60)
 
-    async def _data_input_loop(
-        self,
-        group_buffer: RolloutGroupWorkBuffer,
-    ) -> None:
+    async def _data_input_loop(self, group_buffer: RolloutGroupWorkBuffer) -> None:
         """produces a RolloutGroupWork into group_buffer.
         waits for:    a free active slot (group_buffer.wait_for_slot)
         unblocked by: _trainer_loop release_active_groups(num_prompts_per_train_step, "trained")
