@@ -20,8 +20,8 @@ from monarch.actor import Actor, concurrent_endpoint, current_size
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.distributed.routing.strategies import (
-    LeastLoadedRoutingStrategy,
     RoutingStrategy,
+    StickySessionRoutingStrategy,
 )
 from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
 
@@ -102,11 +102,12 @@ class InterGeneratorRouter(Actor, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         strategy: RoutingStrategy.Config = field(
-            default_factory=LeastLoadedRoutingStrategy.Config
+            default_factory=StickySessionRoutingStrategy.Config
         )
-        """Strategy for choosing a generator for a new routing session, e.g.
-        ``RoundRobinRoutingStrategy.Config()`` or
-        ``LeastLoadedRoutingStrategy.Config()``."""
+        """Routing strategy, selected by its config type, e.g.
+        ``StickySessionRoutingStrategy.Config()`` or
+        ``LeastLoadedRoutingStrategy.Config()``. The default keeps each rollout's
+        turns on one generator, so a turn can reuse its earlier turns' KV cache."""
 
         hot_swap: bool = True
         """When True, pulls model's state dict concurrently with in-flight
@@ -198,7 +199,12 @@ class InterGeneratorRouter(Actor, Configurable):
         routing_group_id: int | None = None,
         **kwargs,
     ) -> Any:
-        """Route a call, sharing cache salt within a group and pinning each rollout."""
+        """Route a call to a strategy-chosen generator and pick its cache namespace.
+
+        The strategy decides placement. The router only restricts it to generators
+        whose version does not roll back the rollout or its group, and chooses the
+        cache version from where the call lands.
+        """
         session_id = routing_ctx.session_id if pin_session else None
         session = self._sessions.get(session_id) if session_id is not None else None
         group_route = (
@@ -206,35 +212,24 @@ class InterGeneratorRouter(Actor, Configurable):
             if pin_session and routing_group_id is not None
             else None
         )
+        if session is not None:
+            min_version = session.max_policy_version
+        elif group_route is not None:
+            min_version = group_route.cache_policy_version
+        else:
+            min_version = None
         while True:
             await self._serving.wait()
-            candidates = self._candidates()
-            if session is not None and any(h is session.generator for h in candidates):
-                h = session.generator
-                break
-            if (
-                session is None
-                and group_route is not None
-                and any(h is group_route.generator for h in candidates)
-            ):
-                h = group_route.generator
-                break
-            if session is not None:
-                min_version = session.max_policy_version
-            elif group_route is not None:
-                min_version = group_route.cache_policy_version
-            else:
-                min_version = None
             eligible = [
                 h
-                for h in candidates
+                for h in self._candidates()
                 if min_version is None
                 or (h.policy_version is not None and h.policy_version >= min_version)
             ]
             if eligible:
                 h = self._strategy.choose(routing_ctx, eligible)
                 break
-            # A replacement generator must not roll back a rollout or group.
+            # A generator older than the rollout or group would roll it back.
             self._routing_state_changed.clear()
             await self._routing_state_changed.wait()
         selected_cache_policy_version = None
@@ -250,15 +245,14 @@ class InterGeneratorRouter(Actor, Configurable):
                     generator=h, cache_policy_version=h.policy_version
                 )
                 self._group_routes[routing_group_id] = group_route
-            # Reuse the salt that stored the KV this request can hit: its own
-            # session's on the session generator, the group's for a new
-            # sibling. A rerouted session has no KV at the destination, so
-            # None makes the destination salt with its own version.
-            selected_cache_policy_version = (
-                session.cache_policy_version
-                if session is not None and h is session.generator
-                else (None if session is not None else group_route.cache_policy_version)
-            )
+            # Reuse the salt of the KV this call can hit: the rollout's on its own
+            # generator, or the group's on the group's generator. Elsewhere there is
+            # no such KV, so None makes the generator salt with its own version.
+            if session is not None:
+                if h is session.generator:
+                    selected_cache_policy_version = session.cache_policy_version
+            elif h is group_route.generator:
+                selected_cache_policy_version = group_route.cache_policy_version
             kwargs["cache_policy_version"] = selected_cache_policy_version
             if session_id is not None and routing_group_id is not None:
                 self._sessions_by_group.setdefault(routing_group_id, set()).add(

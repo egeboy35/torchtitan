@@ -116,26 +116,34 @@ async def _generate(router, *, session_id, turn, group_id=0):
     )
 
 
-def test_generation_pins_group_salt_and_generator_after_weight_sync():
+def _sticky_router(actors) -> InterGeneratorRouter:
+    return _router(
+        actors, strategy=StickySessionRoutingStrategy.Config(), hot_swap=True
+    )
+
+
+def test_later_turns_and_siblings_keep_group_salt_across_weight_sync():
     async def run():
-        actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
-        router = _router(actors, hot_swap=True)
+        actor = _VersionedActor("gen0")
+        router = _sticky_router([actor])
         await router._pull_model_state_dict(policy_version=7)
 
         await _generate(router, session_id="group=0/rollout=0", turn=0)
         await router._pull_model_state_dict(policy_version=8)
+        # A later turn keeps the rollout's salt, a new sibling on the group's
+        # generator keeps the group's salt, and a new group takes the new version.
         await _generate(router, session_id="group=0/rollout=0", turn=1)
         await _generate(router, session_id="group=0/rollout=1", turn=0)
+        await _generate(router, session_id="group=1/rollout=0", turn=0, group_id=1)
 
-        assert [
-            call[1]["cache_policy_version"] for call in actors[0].generate.calls
-        ] == [
+        assert [call[1]["cache_policy_version"] for call in actor.generate.calls] == [
             7,
             7,
             7,
+            8,
         ]
-        assert not actors[1].generate.calls
         router._finish_group(0)
+        router._finish_group(1)
         assert not router._sessions
         assert not router._group_routes
         assert not router._sessions_by_group
@@ -143,55 +151,71 @@ def test_generation_pins_group_salt_and_generator_after_weight_sync():
     asyncio.run(run())
 
 
-def test_concurrent_siblings_share_first_groups_salt_before_completion():
+def test_concurrent_siblings_share_group_salt_before_completion():
     async def run():
-        actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
-        router = _router(actors, hot_swap=True)
+        actor = _VersionedActor("gen0")
+        router = _sticky_router([actor])
         await router._pull_model_state_dict(policy_version=7)
-        actors[0].generate.release.clear()
+        actor.generate.release.clear()
 
         first = asyncio.create_task(
             _generate(router, session_id="group=0/rollout=0", turn=0)
         )
-        await actors[0].generate.started.wait()
+        await actor.generate.started.wait()
+        # The group's namespace is pinned when its first call is routed, so a
+        # concurrent sibling shares it even though a pull lands in between.
+        router._generators[0].policy_version = 8
         second = asyncio.create_task(
             _generate(router, session_id="group=0/rollout=1", turn=0)
         )
         await asyncio.sleep(0)
-        assert len(actors[0].generate.calls) == 2
-        assert not actors[1].generate.calls
-        assert [
-            call[1]["cache_policy_version"] for call in actors[0].generate.calls
-        ] == [7, 7]
-        actors[0].generate.release.set()
+        assert [call[1]["cache_policy_version"] for call in actor.generate.calls] == [
+            7,
+            7,
+        ]
+        actor.generate.release.set()
         await asyncio.gather(first, second)
 
     asyncio.run(run())
 
 
-def test_partial_pull_keeps_old_groups_namespace_for_later_siblings():
+def test_sticky_session_keeps_turns_on_generator_while_siblings_spread():
+    async def run():
+        actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
+        router = _sticky_router(actors)
+        await router._pull_model_state_dict(policy_version=7)
+
+        await _generate(router, session_id="group=0/rollout=0", turn=0)
+        await router._pull_model_state_dict(policy_version=8)
+        # The strategy places a new sibling by load, on the other generator. That
+        # generator holds none of the group's KV, so it salts with its own version.
+        await _generate(router, session_id="group=0/rollout=1", turn=0)
+        await _generate(router, session_id="group=0/rollout=0", turn=1)
+        await _generate(router, session_id="group=0/rollout=1", turn=1)
+
+        assert [
+            call[1]["cache_policy_version"] for call in actors[0].generate.calls
+        ] == [7, 7]
+        assert [
+            call[1]["cache_policy_version"] for call in actors[1].generate.calls
+        ] == [None, 8]
+
+    asyncio.run(run())
+
+
+def test_rollout_moved_by_non_sticky_strategy_takes_destination_version():
     async def run():
         actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
         router = _router(actors, hot_swap=True)
         await router._pull_model_state_dict(policy_version=7)
+
+        # LeastLoaded ignores session affinity, so the second turn moves to the
+        # other generator, where the rollout's earlier KV does not exist.
         await _generate(router, session_id="group=0/rollout=0", turn=0)
+        await _generate(router, session_id="group=0/rollout=0", turn=1)
 
-        actors[1].pull_model_state_dict.started.clear()
-        actors[1].pull_model_state_dict.release.clear()
-        update = asyncio.create_task(router._pull_model_state_dict(policy_version=8))
-        await actors[1].pull_model_state_dict.started.wait()
-        await asyncio.sleep(0)
-        assert [h.policy_version for h in router._generators] == [8, 7]
-
-        second = await _generate(router, session_id="group=0/rollout=1", turn=0)
-        assert second.min_policy_version == 8
-        assert [
-            call[1]["cache_policy_version"] for call in actors[0].generate.calls
-        ] == [7, 7]
-        assert not actors[1].generate.calls
-
-        actors[1].pull_model_state_dict.release.set()
-        await update
+        assert actors[0].generate.calls[0][1]["cache_policy_version"] == 7
+        assert actors[1].generate.calls[0][1]["cache_policy_version"] is None
 
     asyncio.run(run())
 
@@ -199,7 +223,7 @@ def test_partial_pull_keeps_old_groups_namespace_for_later_siblings():
 def test_new_sibling_waits_for_group_version_if_original_generator_unavailable():
     async def run():
         actors = [_VersionedActor("gen0"), _VersionedActor("gen1")]
-        router = _router(actors, hot_swap=True)
+        router = _sticky_router(actors)
         await router._pull_model_state_dict(policy_version=7)
         actors[0].policy_version = 8
         router._generators[0].policy_version = 8
@@ -217,7 +241,8 @@ def test_new_sibling_waits_for_group_version_if_original_generator_unavailable()
         router._generators[1].policy_version = 8
         router._routing_state_changed.set()
         await pending
-        assert actors[1].generate.calls[0][1]["cache_policy_version"] == 8
+        # gen1 holds none of the group's KV, so it salts with its own version.
+        assert actors[1].generate.calls[0][1]["cache_policy_version"] is None
 
     asyncio.run(run())
 
