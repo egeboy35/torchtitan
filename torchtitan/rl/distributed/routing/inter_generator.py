@@ -60,15 +60,29 @@ class _GeneratorHandle(RoutingCandidate):
 
 @dataclass(kw_only=True, slots=True)
 class _RoutingSession:
+    """Router state for one rollout: its cache namespace and how far it has advanced."""
+
     generator: _GeneratorHandle
+    """Generator that ran the rollout's last call and holds its history KV."""
+
     cache_policy_version: int
+    """The rollout's cache namespace, reused while it stays on ``generator``."""
+
     max_policy_version: int
+    """Newest policy version the rollout has sampled; later calls never go to an
+    older generator."""
 
 
 @dataclass(kw_only=True, slots=True)
-class _GroupRoute:
+class _GroupCacheNamespace:
+    """A rollout group's cache namespace, pinned when its first call is routed."""
+
     generator: _GeneratorHandle
+    """Generator that ran the group's first call and holds the group prompt's KV."""
+
     cache_policy_version: int
+    """The group's cache namespace, used by new siblings on ``generator``. New
+    siblings never go to a generator older than it."""
 
 
 class InterGeneratorRouter(Actor, Configurable):
@@ -145,7 +159,7 @@ class InterGeneratorRouter(Actor, Configurable):
 
         self._strategy = config.strategy.build()
         self._sessions: dict[str, _RoutingSession] = {}
-        self._group_routes: dict[int, _GroupRoute] = {}
+        self._group_namespaces: dict[int, _GroupCacheNamespace] = {}
         self._sessions_by_group: dict[int, set[str]] = {}
         self._routing_state_changed = asyncio.Event()
         self._serving = asyncio.Event()
@@ -207,15 +221,15 @@ class InterGeneratorRouter(Actor, Configurable):
         """
         session_id = routing_ctx.session_id if pin_session else None
         session = self._sessions.get(session_id) if session_id is not None else None
-        group_route = (
-            self._group_routes.get(routing_group_id)
+        group_namespace = (
+            self._group_namespaces.get(routing_group_id)
             if pin_session and routing_group_id is not None
             else None
         )
         if session is not None:
             min_version = session.max_policy_version
-        elif group_route is not None:
-            min_version = group_route.cache_policy_version
+        elif group_namespace is not None:
+            min_version = group_namespace.cache_policy_version
         else:
             min_version = None
         while True:
@@ -234,25 +248,25 @@ class InterGeneratorRouter(Actor, Configurable):
             await self._routing_state_changed.wait()
         selected_cache_policy_version = None
         if pin_session:
-            if group_route is None:
+            if group_namespace is None:
                 # Siblings enter concurrently, so pin the group's namespace at
                 # routing without waiting for the first generation to complete.
                 assert routing_group_id is not None
                 assert (
                     h.policy_version is not None
                 ), "generation requires an initial weight pull"
-                group_route = _GroupRoute(
+                group_namespace = _GroupCacheNamespace(
                     generator=h, cache_policy_version=h.policy_version
                 )
-                self._group_routes[routing_group_id] = group_route
+                self._group_namespaces[routing_group_id] = group_namespace
             # Reuse the salt of the KV this call can hit: the rollout's on its own
             # generator, or the group's on the group's generator. Elsewhere there is
             # no such KV, so None makes the generator salt with its own version.
             if session is not None:
                 if h is session.generator:
                     selected_cache_policy_version = session.cache_policy_version
-            elif h is group_route.generator:
-                selected_cache_policy_version = group_route.cache_policy_version
+            elif h is group_namespace.generator:
+                selected_cache_policy_version = group_namespace.cache_policy_version
             kwargs["cache_policy_version"] = selected_cache_policy_version
             if session_id is not None and routing_group_id is not None:
                 self._sessions_by_group.setdefault(routing_group_id, set()).add(
@@ -375,7 +389,7 @@ class InterGeneratorRouter(Actor, Configurable):
         )
 
     def _finish_group(self, group_id: int) -> None:
-        self._group_routes.pop(group_id, None)
+        self._group_namespaces.pop(group_id, None)
         for session_id in self._sessions_by_group.pop(group_id, set()):
             self._sessions.pop(session_id, None)
 

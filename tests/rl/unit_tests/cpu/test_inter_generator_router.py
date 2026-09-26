@@ -145,7 +145,7 @@ def test_later_turns_and_siblings_keep_group_salt_across_weight_sync():
         router._finish_group(0)
         router._finish_group(1)
         assert not router._sessions
-        assert not router._group_routes
+        assert not router._group_namespaces
         assert not router._sessions_by_group
 
     asyncio.run(run())
@@ -283,7 +283,7 @@ def test_finished_group_does_not_keep_a_late_completion_session():
         actor.generate.release.set()
         await pending
         assert not router._sessions
-        assert not router._group_routes
+        assert not router._group_namespaces
 
     asyncio.run(run())
 
