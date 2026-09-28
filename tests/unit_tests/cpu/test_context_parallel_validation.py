@@ -12,6 +12,7 @@ from unittest import mock
 
 from torchtitan.config.transform import ContextParallelTransform
 from torchtitan.distributed.context_parallel import ContextParallelLoadBalancer
+from torchtitan.models.common.attention import FlexInnerAttention
 from torchtitan.protocols.module import Module
 
 
@@ -34,7 +35,9 @@ class TestDecoderConfigCpValidation(unittest.TestCase):
         if cp_kernel:
             # Apply the transform without its final validation.
             ContextParallelTransform(
-                inner_attention=KVAllGatherCPFlexInnerAttention
+                inner_attention_backends={
+                    FlexInnerAttention: KVAllGatherCPFlexInnerAttention
+                }
             ).transform(config.model)
         config.parallelism.context_parallel_degree = cp
         return config
@@ -114,9 +117,9 @@ class TestUlyssesConfigValidation(unittest.TestCase):
             attention.n_heads = n_heads
         if n_kv_heads is not None:
             attention.n_kv_heads = n_kv_heads
-        ContextParallelTransform(inner_attention=UlyssesCPFlexInnerAttention).transform(
-            config.model
-        )
+        ContextParallelTransform(
+            inner_attention_backends={FlexInnerAttention: UlyssesCPFlexInnerAttention}
+        ).transform(config.model)
         config.parallelism.context_parallel_degree = cp
         config.parallelism.tensor_parallel_degree = tp
         config.parallelism.context_parallel_load_balancer = load_balancer
@@ -157,7 +160,7 @@ class TestUlyssesConfigValidation(unittest.TestCase):
         config = self._config(cp=4, tp=2, n_heads=8, n_kv_heads=8)
         config.__post_init__()
 
-    def test_rejects_different_cp_backends(self):
+    def test_allows_different_cp_backends_with_contiguous_sharding(self):
         from dataclasses import fields
 
         from torchtitan.models.common.cp_attention import (
@@ -172,8 +175,7 @@ class TestUlyssesConfigValidation(unittest.TestCase):
         layer.attention.inner_attention = KVAllGatherCPFlexInnerAttention.Config(
             **{f.name: getattr(existing, f.name) for f in fields(existing)}
         )
-        with self.assertRaisesRegex(ValueError, "different CP backends"):
-            config.__post_init__()
+        config.__post_init__()
 
 
 class TestGptOssUlysses(unittest.TestCase):
@@ -222,9 +224,9 @@ class TestHeadDivisibility(unittest.TestCase):
         attention.n_heads = n_heads
         attention.n_kv_heads = n_kv_heads
         if inner_attention is not None:
-            ContextParallelTransform(inner_attention=inner_attention).transform(
-                config.model
-            )
+            ContextParallelTransform(
+                inner_attention_backends={FlexInnerAttention: inner_attention}
+            ).transform(config.model)
         config.parallelism.context_parallel_degree = cp
         config.parallelism.tensor_parallel_degree = tp
         config.parallelism.context_parallel_load_balancer = None
@@ -296,7 +298,13 @@ class TestShippedCpRecipes(unittest.TestCase):
         config.parallelism.context_parallel_degree = 2
         apply_transforms(
             config,
-            [ContextParallelTransform(inner_attention=KVAllGatherCPFlexInnerAttention)],
+            [
+                ContextParallelTransform(
+                    inner_attention_backends={
+                        FlexInnerAttention: KVAllGatherCPFlexInnerAttention
+                    }
+                )
+            ],
         )
 
 

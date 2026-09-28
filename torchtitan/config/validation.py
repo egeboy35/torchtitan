@@ -167,7 +167,7 @@ def validate_model_training_config(
 def validate_context_parallel(
     model: "Module.Config", parallelism: "ParallelismConfig"
 ) -> None:
-    """Validate that each inner attention matches the CP configuration."""
+    """Validate CP backends, load-balancer compatibility, and Ulysses head sharding."""
     from torchtitan.distributed.context_parallel import (
         HeadTailCPLoadBalancer,
         PTRRFlexAttentionCPLoadBalancer,
@@ -175,14 +175,20 @@ def validate_context_parallel(
     from torchtitan.models.common.cp_attention import (
         CPInnerAttention,
         KVAllGatherCPFlexInnerAttention,
+        KVAllGatherCPSlidingWindowFlexInnerAttention,
         UlyssesCPInnerAttention,
     )
 
     cp = parallelism.context_parallel_degree
-    first_cp_config: tuple[str, type] | None = None
     supported_backends: dict[type, tuple[type, ...]] = {
-        HeadTailCPLoadBalancer: (KVAllGatherCPFlexInnerAttention,),
-        PTRRFlexAttentionCPLoadBalancer: (KVAllGatherCPFlexInnerAttention,),
+        HeadTailCPLoadBalancer: (
+            KVAllGatherCPFlexInnerAttention,
+            KVAllGatherCPSlidingWindowFlexInnerAttention,
+        ),
+        PTRRFlexAttentionCPLoadBalancer: (
+            KVAllGatherCPFlexInnerAttention,
+            KVAllGatherCPSlidingWindowFlexInnerAttention,
+        ),
     }
 
     for fqn, traversed, _, _ in model.traverse(BaseAttention.Config):
@@ -204,25 +210,9 @@ def validate_context_parallel(
         if not is_cp_attention:
             continue
 
-        cp_config_type = type(inner_attention)
-        if first_cp_config is None:
-            first_cp_config = (fqn, cp_config_type)
-        elif first_cp_config[1] is not cp_config_type:
-            raise ValueError(
-                f"{fqn}.inner_attention and "
-                f"{first_cp_config[0]}.inner_attention use different CP "
-                "backends, but model inputs are sharded once."
-            )
         backend = inner_attention._owner
         assert backend is not None and issubclass(backend, CPInnerAttention)
-        load_balancer = parallelism.context_parallel_load_balancer
         if issubclass(backend, UlyssesCPInnerAttention):
-            if load_balancer is not None:
-                raise ValueError(
-                    f"{fqn}.inner_attention uses {backend.__qualname__}, so "
-                    "context_parallel_load_balancer must be None."
-                )
-
             head_shard_degree = parallelism.tensor_parallel_degree * cp
             n_heads = attention.n_heads
             n_kv_heads = getattr(attention, "n_kv_heads", None) or n_heads
@@ -233,10 +223,15 @@ def validate_context_parallel(
                         "by tensor_parallel_degree * context_parallel_degree "
                         f"({head_shard_degree})."
                     )
-            continue
 
+        load_balancer = parallelism.context_parallel_load_balancer
         if load_balancer is None:
             continue
+        if issubclass(backend, UlyssesCPInnerAttention):
+            raise ValueError(
+                f"{fqn}.inner_attention uses {backend.__qualname__}, so "
+                "context_parallel_load_balancer must be None."
+            )
         load_balancer_type = load_balancer._owner
         assert load_balancer_type is not None
         if not any(

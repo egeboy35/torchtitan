@@ -6,9 +6,10 @@
 
 """Context-parallel transform."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from torchtitan.models.common.attention import BaseAttention
+from torchtitan.models.common.attention import BaseAttention, InnerAttention
 from torchtitan.models.common.cp_attention import CPInnerAttention
 from torchtitan.protocols.module import Module
 
@@ -19,23 +20,21 @@ __all__ = ["ContextParallelTransform"]
 
 @dataclass(kw_only=True, slots=True)
 class ContextParallelTransform(ModelConfigTransform):
-    """Run attention under context parallelism.
+    """Replace each inner-attention type with its configured CP backend."""
 
-    Replace every inner attention with ``inner_attention`` while preserving its
-    config.
-
-    TODO(fegin): support one kernel per attention type, for models that mix
-    them.
-    """
-
-    inner_attention: type[Module]
-    """Replacement inner attention; must inherit ``CPInnerAttention``."""
+    inner_attention_backends: Mapping[type[InnerAttention], type[InnerAttention]]
+    """Map each source inner-attention type to its CP replacement."""
 
     def __post_init__(self) -> None:
-        if not issubclass(self.inner_attention, CPInnerAttention):
-            raise ValueError(
-                f"{self.inner_attention.__qualname__} must inherit CPInnerAttention."
-            )
+        if not self.inner_attention_backends:
+            raise ValueError("inner_attention_backends must not be empty.")
+        for source, replacement in self.inner_attention_backends.items():
+            if not issubclass(source, InnerAttention):
+                raise ValueError(f"{source.__qualname__} must inherit InnerAttention.")
+            if not issubclass(replacement, CPInnerAttention):
+                raise ValueError(
+                    f"{replacement.__qualname__} must inherit CPInnerAttention."
+                )
 
     def transform(
         self,
@@ -46,7 +45,15 @@ class ContextParallelTransform(ModelConfigTransform):
         del context
         for _, traversed, _, _ in model.traverse(BaseAttention.Config):
             attention = traversed
+            source = attention.inner_attention._owner
+            assert source is not None and issubclass(source, InnerAttention)
+            if source not in self.inner_attention_backends:
+                raise ValueError(
+                    "No context-parallel backend configured for "
+                    f"{source.__qualname__}."
+                )
             attention.inner_attention = convert_config_type(
-                attention.inner_attention, self.inner_attention
+                attention.inner_attention,
+                self.inner_attention_backends[source],
             )
         return model

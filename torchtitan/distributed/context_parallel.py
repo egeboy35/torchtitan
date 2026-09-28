@@ -11,7 +11,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, cast, TYPE_CHECKING
+from typing import Any, cast
 
 import spmd_types as spmd
 import torch
@@ -32,9 +32,6 @@ from torchtitan.distributed.spmd_types import (
     current_spmd_mesh,
     spmd_mesh_group,
 )
-
-if TYPE_CHECKING:
-    from torchtitan.models.common.attention import FlexAttentionMetadata
 
 __all__ = [
     "ContextParallelLoadBalancer",
@@ -66,7 +63,7 @@ class HeadTailCPLoadBalancer(ContextParallelLoadBalancer):
         config: Config,
         *,
         seq_len: int,
-        attention_metadata: FlexAttentionMetadata | None,
+        attention_metadata: BlockMask | None,
     ) -> None:
         del config, attention_metadata
         cp_group = spmd_mesh_group(MeshAxisName.CP)
@@ -102,46 +99,25 @@ class PTRRFlexAttentionCPLoadBalancer(ContextParallelLoadBalancer):
     class Config(Configurable.Config):
         """Configuration for PTRR context-parallel load balancing."""
 
-        mask_key: str | None = None
-        """Mask used to derive the partition when attention metadata is a mapping."""
-
     def __init__(
         self,
         config: Config,
         *,
         seq_len: int,
-        attention_metadata: FlexAttentionMetadata | None,
+        attention_metadata: BlockMask | None,
     ) -> None:
-        del seq_len
-        mask_key = config.mask_key
+        del config, seq_len
 
         if attention_metadata is None:
             raise ValueError(
                 "PTRR load balancing requires attention metadata, but got None."
             )
-        if isinstance(attention_metadata, Mapping):
-            if mask_key is None:
-                raise ValueError(
-                    "PTRR load balancing received a Mapping[str, BlockMask] but no "
-                    "mask key was specified. Set "
-                    "PTRRFlexAttentionCPLoadBalancer.Config(mask_key=...) "
-                    "to one of: "
-                    f"{sorted(attention_metadata.keys())}"
-                )
-            if mask_key not in attention_metadata:
-                raise ValueError(
-                    f"PTRR mask key '{mask_key}' is not a key in attention metadata. "
-                    f"Available keys: {sorted(attention_metadata.keys())}"
-                )
-            block_mask = attention_metadata[mask_key]
-        else:
-            block_mask = attention_metadata
-        if not isinstance(block_mask, BlockMask):
+        if not isinstance(attention_metadata, BlockMask):
             raise ValueError(
-                "PTRR load balancing requires the selected metadata to be a "
-                f"BlockMask, but got {type(block_mask).__name__}."
+                "PTRR load balancing requires BlockMask metadata, but got "
+                f"{type(attention_metadata).__name__}."
             )
-        self.block_mask = block_mask
+        self.block_mask = attention_metadata
         cp_group = spmd_mesh_group(MeshAxisName.CP)
         if cp_group is None:
             raise RuntimeError(
