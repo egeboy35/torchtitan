@@ -25,6 +25,21 @@ an entry in a complete image-override manifest. A task containing only a
 Dockerfile is rejected without an override rather than silently evaluated in
 the wrong environment.
 
+**The task container needs outbound network at scoring time, and removing it
+zeroes the whole benchmark silently.** Every Terminal-Bench 2.1 task ends its
+`tests/test.sh` by installing its own toolchain -- `apt-get`, then `uv` from
+astral.sh, then pytest and the task's pinned libraries from PyPI -- against a
+published image that ships none of it. That is a property of the 89 tasks, not
+of the runtime. Docker's default bridge network provides egress, so the
+default configuration here works; a network-isolated runtime, a hardened
+Docker config, or a host without egress breaks it. The failure is invisible:
+each `test.sh` ends in `if ...; then echo 1; else echo 0; fi`, which exits 0
+whether the tests passed, failed, or were never installed, so the grader
+writes a `0` and Harbor returns it as a real score. Every rollout of every run
+then reports `reward=0.000` while looking perfectly healthy, for every model
+and every configuration. The 12,000 s `scoring` timeout below is sized for
+those installs.
+
 Use a pinned copy of the published Terminal-Bench 2.1 Harbor task tree, not a
 generated JSONL or a directory of task evolution outputs. It should contain
 89 subdirectories with `task.toml`, `instruction.md`, and `tests/test.sh`.
@@ -86,7 +101,17 @@ FSDP compute, full activation checkpointing, and 20-step DCP saves. Historical
 thinking is retained across turns. Verifiers uses the
 Terminus-2 scaffold with Harbor 0.22.0 and stages `tests/` for grading in
 the agent's own container. The binary task reward flows through TitanRL's
-ordinary advantage and GRPO training path. Its XML parser, disabled context
+ordinary advantage and GRPO training path.
+
+`TrainingSampleBuilder.drop_zero_std_reward_groups` defaults to `True`, and the
+reward here is binary. A group whose 32 samples all score 0 has no advantage
+spread and is discarded, which is the right behaviour for training -- but with
+a base model that solves nothing, *every* group is discarded, no batch is ever
+formed, and the run sits in `wait_for_training_batch` indefinitely without
+reaching a second step. It looks like slow rollouts rather than a filter. The
+in-tree integration test at `tests/integration_tests/rl.py` sets the flag to
+`False` for the same reason. Check the base model's pass rate on a handful of
+tasks before concluding that the pipeline is slow. Its XML parser, disabled context
 summarization, and 120-turn limit match the colleague's Terminus-2 setup.
 The example configures these three options on Verifiers' upstream program;
 Terminus-2 itself is not forked. Timeouts are 7,200 seconds for the
@@ -135,6 +160,23 @@ These parts do **not** currently reproduce that branch's measured run:
 - Verifiers' built-in Terminus-2 config does not expose the XML parser and
   summary policy. `harness.py` configures the upstream program for this
   experiment; upstreaming those knobs to Verifiers would remove the adapter.
+- Harbor grading returns `0.0` when the grader never ran, indistinguishable
+  from a task the agent failed. `HarborTask._graded` discards `test.sh`'s
+  result, and both reward-file readers swallow their exceptions and fall back
+  to zero, so "tests ran and the agent failed", "tests never ran", "reward file
+  missing" and "reward file unparseable" are one value. Distinguishing a
+  missing reward file from one containing `0` would separate the infrastructure
+  cases without needing anything from task scripts; the exit code alone would
+  not, because every TB2.1 `test.sh` ends in an `if`/`echo` that exits 0
+  regardless. Until that lands, a run of uniform zeros here should be treated
+  as unexplained rather than as a capability measurement.
+- TitanRL does not read `Trace.metrics`. Verifiers implements that channel
+  fully -- a `@metric` decorator whose functions are collected around every
+  rollout -- but the adapter in `torchtitan/rl/examples/verifiers` consumes
+  only `generation_metadata.metrics`, and `Rollout` has no field to hold the
+  rest. Per-rollout metrics emitted by a taskset therefore cross the process
+  boundary and are dropped without warning. Anything this experiment wants to
+  report per rollout needs its own delivery path today.
 - Verifiers' Harbor fixture staging restores host file ownership, which fails
   in a rootless container with unmapped host IDs. `data.py` keeps the upstream
   grading contract but extracts test files with `--no-same-owner`. This should
