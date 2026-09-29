@@ -164,7 +164,7 @@ These parts do **not** currently reproduce that branch's measured run:
   from a task the agent failed. `HarborTask._graded` discards `test.sh`'s
   result, and both reward-file readers swallow their exceptions and fall back
   to zero, so "tests ran and the agent failed", "tests never ran", "reward file
-  missing" and "reward file unparseable" are one value. Distinguishing a
+  missing" and "reward file unparsable" are one value. Distinguishing a
   missing reward file from one containing `0` would separate the infrastructure
   cases without needing anything from task scripts; the exit code alone would
   not, because every TB2.1 `test.sh` ends in an `if`/`echo` that exits 0
