@@ -103,16 +103,15 @@ class _VersionedActor(_Actor):
 
 
 async def _generate(router, *, session_id, turn, group_id=0):
-    return await router._route(
+    return await router._route_rollout_call(
         "generate",
         [1, 2],
+        group_id=group_id,
         request_id=f"{session_id}/turn={turn}",
         routing_session_id=session_id,
-        routing_group_id=group_id,
         sampling_config=None,
         metrics_prefix="generator",
         routing_ctx=RoutingContext(estimated_cost=1, session_id=session_id),
-        pin_session=True,
     )
 
 

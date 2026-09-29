@@ -209,26 +209,11 @@ class InterGeneratorRouter(Actor, Configurable):
         method: str,
         *args,
         routing_ctx: RoutingContext,
-        pin_session: bool = False,
-        routing_group_id: int | None = None,
         **kwargs,
     ) -> Any:
         """Dispatch one call to a strategy-chosen serving generator's rank 0;
         return its result.
-
-        With ``pin_session``, the call is one turn of a rollout in group
-        ``routing_group_id``, and the router also picks its KV cache namespace;
-        see ``_route_rollout_call``.
         """
-        if pin_session:
-            assert routing_group_id is not None
-            return await self._route_rollout_call(
-                method,
-                *args,
-                routing_ctx=routing_ctx,
-                group_id=routing_group_id,
-                **kwargs,
-            )
         await self._serving.wait()
         candidates = self._candidates()
         assert candidates, "serving event was set with no serving generators"
@@ -441,17 +426,16 @@ class InterGeneratorRouter(Actor, Configurable):
         metrics_prefix: str,
     ) -> Any:
         """Route one generation call to a generator and return its completion."""
-        return await self._route(
+        return await self._route_rollout_call(
             "generate",
             prompt_token_ids,
+            group_id=routing_group_id,
             request_id=request_id,
             # VLLMGenerator.generate also requires this field for its
             # intra-mesh DP routing.
             routing_session_id=routing_session_id,
-            routing_group_id=routing_group_id,
             sampling_config=sampling_config,
             metrics_prefix=metrics_prefix,
-            pin_session=True,
             # Load is measured as in-flight request count (one unit per call).
             routing_ctx=RoutingContext(
                 estimated_cost=1,
