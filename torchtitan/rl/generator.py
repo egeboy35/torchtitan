@@ -1188,17 +1188,11 @@ class VLLMGenerator(Configurable):
                     if local_requests:
                         # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
                         # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
-                        # cache_salt is the request's group version, or this generator's installed version
-                        # for a rerouted rollout that carries none.
                         engine_inputs = self._engine.renderer.render_cmpl(
                             [
                                 {
                                     "prompt_token_ids": request.prompt_token_ids,
-                                    "cache_salt": str(
-                                        self.policy_version
-                                        if request.cache_policy_version is None
-                                        else request.cache_policy_version
-                                    ),
+                                    "cache_salt": self._cache_salt(request),
                                 }
                                 for request in local_requests
                             ]
@@ -1276,6 +1270,13 @@ class VLLMGenerator(Configurable):
                 self._pull_model_state_dict_future.set_exception(exc)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
+
+    def _cache_salt(self, request: GenerationRequest) -> str:
+        """vLLM cache salt for ``request``: the version the router chose, or this
+        generator's installed version when the router passed None."""
+        if request.cache_policy_version is None:
+            return str(self.policy_version)
+        return str(request.cache_policy_version)
 
     def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
         """Translate a `SamplingConfig` into vLLM `SamplingParams` (n=1).

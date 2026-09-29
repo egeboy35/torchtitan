@@ -213,89 +213,158 @@ class InterGeneratorRouter(Actor, Configurable):
         routing_group_id: int | None = None,
         **kwargs,
     ) -> Any:
-        """Route a call to a strategy-chosen generator and pick its cache namespace.
+        """Dispatch one call to a strategy-chosen serving generator's rank 0;
+        return its result.
 
-        The strategy decides placement. The router only restricts it to generators
-        whose version does not roll back the rollout or its group, and chooses the
-        cache version from where the call lands.
+        With ``pin_session``, the call is one turn of a rollout in group
+        ``routing_group_id``, and the router also picks its KV cache namespace;
+        see ``_route_rollout_call``.
         """
-        session_id = routing_ctx.session_id if pin_session else None
+        if pin_session:
+            assert routing_group_id is not None
+            return await self._route_rollout_call(
+                method,
+                *args,
+                routing_ctx=routing_ctx,
+                group_id=routing_group_id,
+                **kwargs,
+            )
+        await self._serving.wait()
+        candidates = self._candidates()
+        assert candidates, "serving event was set with no serving generators"
+        h = self._strategy.choose(routing_ctx, candidates)
+        return await self._dispatch(h, method, *args, routing_ctx=routing_ctx, **kwargs)
+
+    async def _route_rollout_call(
+        self,
+        method: str,
+        *args,
+        routing_ctx: RoutingContext,
+        group_id: int,
+        **kwargs,
+    ) -> Any:
+        """Route one rollout turn and pass the ``cache_policy_version`` to salt its KV with.
+
+        1. Wait for a generator whose version does not roll back the rollout or
+           its group; the strategy places the call among those.
+        2. Pin the group's cache namespace on its first routed call.
+        3. Reuse the salt of the KV the call can hit on that generator, if any.
+        4. After the call, remember where the rollout ran and at which versions.
+        """
+        session_id = routing_ctx.session_id
         while True:
             await self._serving.wait()
-            # Read the routing state after every wait: while this call waited, a
-            # sibling may have pinned the group's namespace.
+            # Re-read after every wait: while this call waited, a sibling may
+            # have pinned the group's namespace.
             session = self._sessions.get(session_id) if session_id is not None else None
-            group_namespace = (
-                self._group_namespaces.get(routing_group_id)
-                if pin_session and routing_group_id is not None
-                else None
+            group = self._group_namespaces.get(group_id)
+            h = self._choose_not_older_than(
+                routing_ctx, self._min_policy_version(session, group)
             )
-            if session is not None:
-                min_version = session.max_policy_version
-            elif group_namespace is not None:
-                min_version = group_namespace.cache_policy_version
-            else:
-                min_version = None
-            eligible = [
-                h
-                for h in self._candidates()
-                if min_version is None
-                or (h.policy_version is not None and h.policy_version >= min_version)
-            ]
-            if eligible:
-                h = self._strategy.choose(routing_ctx, eligible)
+            if h is not None:
                 break
-            # A generator older than the rollout or group would roll it back.
             self._routing_state_changed.clear()
             await self._routing_state_changed.wait()
-        selected_cache_policy_version = None
-        if pin_session:
-            if group_namespace is None:
-                # Siblings enter concurrently, so pin the group's namespace at
-                # routing without waiting for the first generation to complete.
-                assert routing_group_id is not None
-                assert (
-                    h.policy_version is not None
-                ), "generation requires an initial weight pull"
-                group_namespace = _GroupCacheNamespace(
-                    generator=h, cache_policy_version=h.policy_version
-                )
-                self._group_namespaces[routing_group_id] = group_namespace
-            # Reuse the salt of the KV this call can hit: the rollout's on its own
-            # generator, or the group's on the group's generator. Elsewhere there is
-            # no such KV, so None makes the generator salt with its own version.
-            if session is not None:
-                if h is session.generator:
-                    selected_cache_policy_version = session.cache_policy_version
-            elif h is group_namespace.generator:
-                selected_cache_policy_version = group_namespace.cache_policy_version
-            kwargs["cache_policy_version"] = selected_cache_policy_version
-            if session_id is not None and routing_group_id is not None:
-                self._sessions_by_group.setdefault(routing_group_id, set()).add(
-                    session_id
-                )
+
+        if group is None:
+            # Siblings enter concurrently, so pin the namespace now rather than
+            # after the first generation completes.
+            assert (
+                h.policy_version is not None
+            ), "generation requires an initial weight pull"
+            group = _GroupCacheNamespace(
+                generator=h, cache_policy_version=h.policy_version
+            )
+            self._group_namespaces[group_id] = group
+        cache_policy_version = self._reusable_cache_policy_version(h, session, group)
+        if session_id is not None:
+            self._sessions_by_group.setdefault(group_id, set()).add(session_id)
+
+        result = await self._dispatch(
+            h,
+            method,
+            *args,
+            routing_ctx=routing_ctx,
+            cache_policy_version=cache_policy_version,
+            **kwargs,
+        )
+
+        # Skip recording if the group finished while the call was in flight.
+        if session_id is not None and session_id in self._sessions_by_group.get(
+            group_id, ()
+        ):
+            self._sessions[session_id] = _RoutingSession(
+                generator=h,
+                # None means the generator salted with its own installed
+                # version, which is the completion's min version.
+                cache_policy_version=(
+                    cache_policy_version
+                    if cache_policy_version is not None
+                    else result.min_policy_version
+                ),
+                max_policy_version=(
+                    max(session.max_policy_version, result.max_policy_version)
+                    if session is not None
+                    else result.max_policy_version
+                ),
+            )
+        return result
+
+    @staticmethod
+    def _min_policy_version(
+        session: _RoutingSession | None, group: _GroupCacheNamespace | None
+    ) -> int | None:
+        """Oldest generator version that does not roll back the call.
+
+        A later turn must not run older than anything its rollout already
+        sampled; a new sibling must not run older than its group's namespace.
+        """
+        if session is not None:
+            return session.max_policy_version
+        if group is not None:
+            return group.cache_policy_version
+        return None
+
+    def _choose_not_older_than(
+        self, routing_ctx: RoutingContext, min_policy_version: int | None
+    ) -> _GeneratorHandle | None:
+        """Let the strategy choose among serving generators at or above
+        ``min_policy_version``; return None if there are none."""
+        eligible = [
+            h
+            for h in self._candidates()
+            if min_policy_version is None
+            or (h.policy_version is not None and h.policy_version >= min_policy_version)
+        ]
+        return self._strategy.choose(routing_ctx, eligible) if eligible else None
+
+    @staticmethod
+    def _reusable_cache_policy_version(
+        h: _GeneratorHandle,
+        session: _RoutingSession | None,
+        group: _GroupCacheNamespace,
+    ) -> int | None:
+        """Salt of the KV the call can hit on ``h``: the rollout's on the
+        generator it last ran on, or, for a new rollout, the group's on the
+        group's generator. Elsewhere there is no such KV, and None makes the
+        generator salt with its own installed version.
+        """
+        if session is not None:
+            return session.cache_policy_version if h is session.generator else None
+        return group.cache_policy_version if h is group.generator else None
+
+    async def _dispatch(
+        self,
+        h: _GeneratorHandle,
+        method: str,
+        *args,
+        routing_ctx: RoutingContext,
+        **kwargs,
+    ) -> Any:
+        """Call ``method`` on ``h``'s rank 0 while holding its load reservation."""
         self._reserve(h, routing_ctx.estimated_cost)
         try:
-            result = await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
-            if session_id is not None and (
-                routing_group_id is None
-                or session_id in self._sessions_by_group.get(routing_group_id, ())
-            ):
-                self._sessions[session_id] = _RoutingSession(
-                    generator=h,
-                    cache_policy_version=(
-                        selected_cache_policy_version
-                        if selected_cache_policy_version is not None
-                        else result.min_policy_version
-                    ),
-                    max_policy_version=max(
-                        session.max_policy_version
-                        if session is not None
-                        else result.max_policy_version,
-                        result.max_policy_version,
-                    ),
-                )
-            return result
+            return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
         finally:
             self._release(h, routing_ctx.estimated_cost)
 
