@@ -236,9 +236,7 @@ class VerifiersRollouter(Rollouter):
         """Run sibling rollouts through Verifiers, then compute advantages."""
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
-        with self._generation_server.serve_group(
-            generate_fn, group_id=group_id
-        ) as group_key:
+        with self._generation_server.serve_group(generate_fn) as group_key:
             rollouts = await asyncio.gather(
                 *(
                     self._run_single_rollout(

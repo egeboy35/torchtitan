@@ -268,8 +268,11 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
             start_versions_by_group[rollout.group_id].append(
                 rollout.turns[0].min_policy_version
             )
+    # Only groups with siblings have a spread; validation groups have one rollout.
     start_version_spreads = [
-        max(versions) - min(versions) for versions in start_versions_by_group.values()
+        max(versions) - min(versions)
+        for versions in start_versions_by_group.values()
+        if len(versions) > 1
     ]
 
     out: list[m.Metric] = [
@@ -284,13 +287,16 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}/total_length", m.Max.from_list(total_lens)),
         m.Metric(f"{prefix}/num_turns", m.Mean.from_list(num_turns)),
         m.Metric(f"{prefix}/num_turns", m.Max.from_list(num_turns)),
-        m.Metric(
-            f"{prefix}/group_start_policy_version_spread",
-            m.Mean.from_list(start_version_spreads),
-        ),
         m.Metric(f"{prefix}/truncation_rate", m.Mean.from_list(truncated)),
         m.Metric(f"{prefix}_reward", m.SummaryStats.from_list(rewards)),
     ]
+    if start_version_spreads:
+        out.append(
+            m.Metric(
+                f"{prefix}/group_start_policy_version_spread",
+                m.Mean.from_list(start_version_spreads),
+            )
+        )
 
     # Per-component reward breakdown
     values_by_name: dict[str, list[float]] = defaultdict(list)

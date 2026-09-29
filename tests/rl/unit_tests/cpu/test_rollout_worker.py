@@ -157,7 +157,6 @@ def test_worker_executes_group_without_actor_mesh() -> None:
             "group=7/rollout=0/turn=0",
             "group=7/rollout=1/turn=0",
         ]
-        assert [call[1]["routing_group_id"] for call in generate_fn.calls] == [7, 7]
         assert [call[1]["sampling_config"].seed for call in generate_fn.calls] == [
             11,
             12,

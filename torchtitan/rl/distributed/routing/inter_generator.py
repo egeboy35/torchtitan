@@ -84,6 +84,9 @@ class _GroupCacheNamespace:
     """The group's cache namespace, used by new siblings on ``generator``. New
     siblings never go to a generator older than it."""
 
+    sessions: dict[str, _RoutingSession] = field(default_factory=dict)
+    """The group's rollouts that have completed a call, keyed by session id."""
+
 
 class InterGeneratorRouter(Actor, Configurable):
     """Routes generation calls across generator meshes and pulls model's state dict.
@@ -158,9 +161,7 @@ class InterGeneratorRouter(Actor, Configurable):
             h.idle.set()
 
         self._strategy = config.strategy.build()
-        self._sessions: dict[str, _RoutingSession] = {}
         self._group_namespaces: dict[int, _GroupCacheNamespace] = {}
-        self._sessions_by_group: dict[int, set[str]] = {}
         self._routing_state_changed = asyncio.Event()
         self._serving = asyncio.Event()
         self._refresh_serving_status()
@@ -209,22 +210,6 @@ class InterGeneratorRouter(Actor, Configurable):
         method: str,
         *args,
         routing_ctx: RoutingContext,
-        **kwargs,
-    ) -> Any:
-        """Dispatch one call to a strategy-chosen serving generator's rank 0;
-        return its result.
-        """
-        await self._serving.wait()
-        candidates = self._candidates()
-        assert candidates, "serving event was set with no serving generators"
-        h = self._strategy.choose(routing_ctx, candidates)
-        return await self._dispatch(h, method, *args, routing_ctx=routing_ctx, **kwargs)
-
-    async def _route_rollout_call(
-        self,
-        method: str,
-        *args,
-        routing_ctx: RoutingContext,
         group_id: int,
         **kwargs,
     ) -> Any:
@@ -241,8 +226,12 @@ class InterGeneratorRouter(Actor, Configurable):
             await self._serving.wait()
             # Re-read after every wait: while this call waited, a sibling may
             # have pinned the group's namespace.
-            session = self._sessions.get(session_id) if session_id is not None else None
             group = self._group_namespaces.get(group_id)
+            session = (
+                group.sessions.get(session_id)
+                if group is not None and session_id is not None
+                else None
+            )
             h = self._choose_not_older_than(
                 routing_ctx, self._min_policy_version(session, group)
             )
@@ -262,8 +251,6 @@ class InterGeneratorRouter(Actor, Configurable):
             )
             self._group_namespaces[group_id] = group
         cache_policy_version = self._reusable_cache_policy_version(h, session, group)
-        if session_id is not None:
-            self._sessions_by_group.setdefault(group_id, set()).add(session_id)
 
         result = await self._dispatch(
             h,
@@ -274,11 +261,9 @@ class InterGeneratorRouter(Actor, Configurable):
             **kwargs,
         )
 
-        # Skip recording if the group finished while the call was in flight.
-        if session_id is not None and session_id in self._sessions_by_group.get(
-            group_id, ()
-        ):
-            self._sessions[session_id] = _RoutingSession(
+        # If the group finished during the call, this updates a detached record.
+        if session_id is not None:
+            group.sessions[session_id] = _RoutingSession(
                 generator=h,
                 # None means the generator salted with its own installed
                 # version, which is the completion's min version.
@@ -426,7 +411,7 @@ class InterGeneratorRouter(Actor, Configurable):
         metrics_prefix: str,
     ) -> Any:
         """Route one generation call to a generator and return its completion."""
-        return await self._route_rollout_call(
+        return await self._route(
             "generate",
             prompt_token_ids,
             group_id=routing_group_id,
@@ -445,12 +430,10 @@ class InterGeneratorRouter(Actor, Configurable):
 
     def _finish_group(self, group_id: int) -> None:
         self._group_namespaces.pop(group_id, None)
-        for session_id in self._sessions_by_group.pop(group_id, set()):
-            self._sessions.pop(session_id, None)
 
     @concurrent_endpoint
     async def finish_group(self, group_id: int) -> None:
-        """Release all routing sessions from a completed rollout group."""
+        """Release a completed rollout group's routing state."""
         self._finish_group(group_id)
 
     @concurrent_endpoint

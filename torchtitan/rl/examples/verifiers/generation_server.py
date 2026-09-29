@@ -34,17 +34,6 @@ each rollout group tags its requests with the key from ``serve_group``.
 
 
 @dataclass(frozen=True, slots=True)
-class _RegisteredGroup:
-    """A rollout group served by this server, looked up by its request key."""
-
-    generate_fn: GenerateFn
-    """Generation entry point for the group, e.g. for training or validation."""
-
-    group_id: int
-    """Rollout group id forwarded to ``generate_fn`` as ``routing_group_id``."""
-
-
-@dataclass(frozen=True, slots=True)
 class VerifiersGenerationMetadata:
     """TorchTitan generation data aggregated over one Verifiers rollout.
 
@@ -72,9 +61,9 @@ class GenerationServer(Configurable):
     to that function, and retains TorchTitan policy-version and metric metadata
     that the resulting Verifiers trace does not carry.
 
-    Concurrent rollout groups share this server. Each group registers its
-    ``GenerateFn`` and group id, and every request selects them by key, so it
-    is generated as part of its own group.
+    Concurrent rollout groups share this server. Each group registers its own
+    ``GenerateFn``, and every request selects it by key, so it is generated as
+    part of its own group.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -105,7 +94,7 @@ class GenerationServer(Configurable):
         self.host = config.host
         self.requested_port = config.port
         self.max_rollout_tokens = config.max_rollout_tokens
-        self.groups: dict[str, _RegisteredGroup] = {}
+        self.groups: dict[str, GenerateFn] = {}
         self.runner: web.AppRunner | None = None
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
@@ -123,15 +112,14 @@ class GenerationServer(Configurable):
         return f"http://{self.host}:{self.port}/v1"
 
     @contextlib.contextmanager
-    def serve_group(self, generate_fn: GenerateFn, *, group_id: int) -> Iterator[str]:
-        """Register a rollout group for the duration of the block.
+    def serve_group(self, generate_fn: GenerateFn) -> Iterator[str]:
+        """Register a rollout group's ``generate_fn`` for the duration of the block.
 
         Yields the key that the group's requests pass as ``GROUP_KEY_SAMPLING_PARAM``.
-        Each request is forwarded to ``generate_fn`` with ``group_id``. Requests
-        that arrive after the block exits are rejected.
+        Requests that arrive after the block exits are rejected.
         """
         key = uuid.uuid4().hex
-        self.groups[key] = _RegisteredGroup(generate_fn=generate_fn, group_id=group_id)
+        self.groups[key] = generate_fn
         try:
             yield key
         finally:
@@ -220,8 +208,8 @@ class GenerationServer(Configurable):
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
             return web.json_response({"error": str(error)}, status=400)
-        group = self.groups.get(group_key)
-        if group is None:
+        generate_fn = self.groups.get(group_key)
+        if generate_fn is None:
             # The rollout group that owned this key has finished.
             return web.json_response(
                 {"error": f"unknown rollout group key {group_key!r}"}, status=409
@@ -231,11 +219,10 @@ class GenerationServer(Configurable):
         self.request_counts[session_id] = request_index + 1
         request_id = f"{session_id}/request={request_index}"
         try:
-            completion = await group.generate_fn(
+            completion = await generate_fn(
                 prompt_token_ids,
                 request_id=request_id,
                 routing_session_id=session_id,
-                routing_group_id=group.group_id,
                 sampling_config=sampling,
             )
         except asyncio.CancelledError:

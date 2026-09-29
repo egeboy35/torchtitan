@@ -34,62 +34,16 @@ from torchtitan.rl.types import (
 )
 
 
-def test_generate_fn_forwards_group_id_to_router() -> None:
+@pytest.mark.parametrize("fail_group", [False, True])
+def test_group_routes_with_its_group_id_and_releases_routing_state(
+    fail_group: bool,
+) -> None:
     class _GenerateEndpoint:
-        def __init__(self) -> None:
+        def __init__(self):
             self.calls = []
 
         async def call_one(self, prompt_token_ids, **kwargs):
-            self.calls.append((prompt_token_ids, kwargs))
-            return Completion(
-                min_policy_version=7,
-                max_policy_version=7,
-                request_id=kwargs["request_id"],
-                token_ids=[3],
-                token_logprobs=[-0.1],
-            )
-
-    async def run() -> None:
-        controller = Controller.__new__(Controller)
-        endpoint = _GenerateEndpoint()
-        controller.generator_router = type("Router", (), {"generate": endpoint})()
-        # One GenerateFn serves every group; each call names its own group.
-        generate = controller._make_generate_fn("generator")
-
-        await generate(
-            [1, 2],
-            request_id="group=3/rollout=0/turn=1",
-            routing_session_id="group=3/rollout=0",
-            routing_group_id=3,
-        )
-        await generate(
-            [1, 2, 3],
-            request_id="group=3/rollout=0/turn=2",
-            routing_session_id="group=3/rollout=0",
-            routing_group_id=3,
-        )
-        await generate(
-            [4, 5],
-            request_id="group=4/rollout=0/turn=0",
-            routing_session_id="group=4/rollout=0",
-            routing_group_id=4,
-        )
-        with pytest.raises(ValueError, match="routing_group_id is required"):
-            await generate([6], request_id="no-group", routing_session_id="s")
-
-        assert [kwargs["routing_group_id"] for _, kwargs in endpoint.calls] == [
-            3,
-            3,
-            4,
-        ]
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("fail_group", [False, True])
-def test_group_releases_routing_sessions(fail_group: bool) -> None:
-    class _GenerateEndpoint:
-        async def call_one(self, prompt_token_ids, **kwargs):
+            self.calls.append(kwargs)
             return Completion(
                 min_policy_version=7,
                 max_policy_version=7,
@@ -111,7 +65,6 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
                 [1, 2],
                 request_id=f"group={group_id}/rollout=0/turn=0",
                 routing_session_id=f"group={group_id}/rollout=0",
-                routing_group_id=group_id,
             )
             if fail_group:
                 raise RuntimeError("rollout failed")
@@ -119,17 +72,18 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
 
     async def run() -> None:
         controller = Controller.__new__(Controller)
+        generate_endpoint = _GenerateEndpoint()
         finish_endpoint = _FinishEndpoint()
         controller.generator_router = type(
             "Router",
             (),
-            {"generate": _GenerateEndpoint(), "finish_group": finish_endpoint},
+            {"generate": generate_endpoint, "finish_group": finish_endpoint},
         )()
         controller._rollouter = _Rollouter()
         if fail_group:
             with pytest.raises(RuntimeError, match="rollout failed"):
                 await controller._run_group_rollouts(
-                    generate_fn=controller._make_generate_fn("generator"),
+                    metrics_prefix="generator",
                     sample=object(),
                     group_id=3,
                     group_size=1,
@@ -137,12 +91,13 @@ def test_group_releases_routing_sessions(fail_group: bool) -> None:
                 )
         else:
             await controller._run_group_rollouts(
-                generate_fn=controller._make_generate_fn("generator"),
+                metrics_prefix="generator",
                 sample=object(),
                 group_id=3,
                 group_size=1,
                 sampling=object(),
             )
+        assert [kwargs["routing_group_id"] for kwargs in generate_endpoint.calls] == [3]
         assert finish_endpoint.calls == [3]
 
     asyncio.run(run())
@@ -164,7 +119,7 @@ def test_finish_group_failure_keeps_rollout_result() -> None:
         )()
         controller._rollouter = _Rollouter()
         group = await controller._run_group_rollouts(
-            generate_fn=None,
+            metrics_prefix="generator",
             sample=object(),
             group_id=3,
             group_size=1,

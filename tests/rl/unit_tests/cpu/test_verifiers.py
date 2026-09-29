@@ -126,7 +126,6 @@ def test_generation_server_forwards_token_request() -> None:
             *,
             request_id,
             routing_session_id=None,
-            routing_group_id=None,
             sampling_config=None,
         ):
             received.append(
@@ -150,7 +149,7 @@ def test_generation_server_forwards_token_request() -> None:
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
         await server.start()
         try:
-            with server.serve_group(generate_fn, group_id=1) as group_key:
+            with server.serve_group(generate_fn) as group_key:
                 async with ClientSession() as session:
                     response = await session.get(f"{server.base_url}/models")
                     assert response.status == 200
@@ -214,7 +213,6 @@ def test_generation_server_rejects_aborted_generation() -> None:
             *,
             request_id,
             routing_session_id=None,
-            routing_group_id=None,
             sampling_config=None,
         ):
             return Completion(
@@ -229,7 +227,7 @@ def test_generation_server_rejects_aborted_generation() -> None:
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
         await server.start()
         try:
-            with server.serve_group(generate_fn, group_id=1) as group_key:
+            with server.serve_group(generate_fn) as group_key:
                 async with ClientSession() as session:
                     response = await session.post(
                         f"http://{server.host}:{server.port}/inference/v1/generate",
@@ -263,34 +261,36 @@ def test_generation_server_close_during_group_does_not_raise() -> None:
         server = GenerationServer.Config(max_rollout_tokens=40960).build()
         await server.start()
         # Shutdown can clear the registry while a group is still being served.
-        with server.serve_group(generate_fn, group_id=3):
+        with server.serve_group(generate_fn):
             await server.close()
         assert server.groups == {}
 
     asyncio.run(run_test())
 
 
-def test_generation_server_forwards_each_request_with_its_group_id() -> None:
+def test_generation_server_forwards_each_request_to_its_group() -> None:
     async def run_test() -> None:
         received: list[tuple[int, str]] = []
 
-        async def generate_fn(
-            prompt_token_ids,
-            *,
-            request_id,
-            routing_session_id=None,
-            routing_group_id=None,
-            sampling_config=None,
-        ):
-            received.append((routing_group_id, routing_session_id))
-            return Completion(
-                min_policy_version=1,
-                max_policy_version=1,
-                request_id=request_id,
-                token_ids=[31],
-                token_logprobs=[-0.1],
-                finish_reason="stop",
-            )
+        def make_generate_fn(group_id: int):
+            async def generate_fn(
+                prompt_token_ids,
+                *,
+                request_id,
+                routing_session_id=None,
+                sampling_config=None,
+            ):
+                received.append((group_id, routing_session_id))
+                return Completion(
+                    min_policy_version=1,
+                    max_policy_version=1,
+                    request_id=request_id,
+                    token_ids=[31],
+                    token_logprobs=[-0.1],
+                    finish_reason="stop",
+                )
+
+            return generate_fn
 
         async def post(session, key: str, session_id: str):
             return await session.post(
@@ -306,9 +306,9 @@ def test_generation_server_forwards_each_request_with_its_group_id() -> None:
         await server.start()
         try:
             async with ClientSession() as session:
-                with server.serve_group(generate_fn, group_id=3) as key_3:
+                with server.serve_group(make_generate_fn(3)) as key_3:
                     # Group 4 registers after group 3, as a later concurrent group would.
-                    with server.serve_group(generate_fn, group_id=4) as key_4:
+                    with server.serve_group(make_generate_fn(4)) as key_4:
                         assert (await post(session, key_3, "trace-a")).status == 200
                         assert (await post(session, key_4, "trace-b")).status == 200
                     response = await post(session, key_4, "trace-b")
