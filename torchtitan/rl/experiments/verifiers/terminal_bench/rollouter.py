@@ -54,14 +54,12 @@ def terminal_bench_rollouter_config(
     *,
     train_images_path: Path | None = None,
     validation_images_path: Path | None = None,
-    eval_only: bool = False,
 ) -> TerminalBenchRollouter.Config:
     """Select frozen task trees; never mix benchmark tasks into training."""
     train_root = train_tasks_root.resolve()
     validation_root = validation_tasks_root.resolve()
-    if not eval_only and (
-        train_root.is_relative_to(validation_root)
-        or validation_root.is_relative_to(train_root)
+    if train_root.is_relative_to(validation_root) or validation_root.is_relative_to(
+        train_root
     ):
         raise ValueError(
             "Training and Terminal-Bench evaluation must use different trees"
@@ -73,11 +71,10 @@ def terminal_bench_rollouter_config(
             verifiers_taskset=TerminalTasksetConfig(
                 id=taskset_id,
                 tasks_root=train_tasks_root,
-                expected_num_tasks=89 if eval_only else None,
                 image_overrides_path=train_images_path,
             ),
             seed=42,
-            shuffle=not eval_only,
+            shuffle=True,
         ),
         validation_dataset=VerifiersTaskDataset.Config(
             verifiers_taskset=TerminalTasksetConfig(

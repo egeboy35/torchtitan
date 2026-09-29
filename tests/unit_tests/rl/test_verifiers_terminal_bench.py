@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,9 +25,6 @@ from torchtitan.rl.controller import Controller
 from torchtitan.rl.examples.verifiers import VerifiersTaskDataset
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
 from torchtitan.rl.experiments.verifiers.terminal_bench import data
-from torchtitan.rl.experiments.verifiers.terminal_bench.controller import (
-    TerminalBenchController,
-)
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarness,
     TerminalBenchTerminusHarnessConfig,
@@ -261,58 +257,6 @@ def test_training_cannot_read_benchmark_as_training_data(tmp_path: Path) -> None
         terminal_bench_rollouter_config(tmp_path, tmp_path)
     with pytest.raises(ValueError, match="different trees"):
         terminal_bench_rollouter_config(tmp_path, tmp_path / "eval")
-    assert (
-        terminal_bench_rollouter_config(
-            tmp_path, tmp_path, eval_only=True
-        ).train_dataset.verifiers_taskset.expected_num_tasks
-        == 89
-    )
-
-
-def test_config_registration_and_eval_only_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("TERMINAL_BENCH_EVAL_TASKS_ROOT", str(tmp_path / "eval"))
-    monkeypatch.setenv("TERMINAL_BENCH_CHECKPOINT", str(tmp_path / "checkpoint"))
-    config = ConfigManager().parse_args(
-        [
-            "--module",
-            "torchtitan.rl.experiments.verifiers.terminal_bench",
-            "--config",
-            "rl_grpo_qwen35_9b_terminal_bench_eval",
-        ]
-    )
-    assert config.model.dim == 4096
-    assert config.model.max_context_length == 65536
-    assert config.async_loop.num_training_steps == 0
-    assert config.eval_only
-    assert config.async_loop.validation.num_samples == 89
-    assert config.trainer.checkpointer.initial_load_path == str(tmp_path / "checkpoint")
-    assert not config.trainer.checkpointer.initial_load_in_hf
-
-
-def test_eval_only_runs_one_validation_without_training() -> None:
-    controller = object.__new__(TerminalBenchController)
-    controller.config = SimpleNamespace(eval_only=True)
-    controller.start_step = 0
-    controller._validate_and_log = AsyncMock()
-
-    asyncio.run(controller.run())
-
-    controller._validate_and_log.assert_awaited_once_with(step=0)
-
-
-def test_training_uses_standard_titanrl_controller(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    main_loop = AsyncMock()
-    monkeypatch.setattr(Controller, "run", main_loop)
-    controller = object.__new__(TerminalBenchController)
-    controller.config = SimpleNamespace(eval_only=False)
-
-    asyncio.run(controller.run())
-
-    main_loop.assert_awaited_once_with()
 
 
 def test_training_recipe_uses_separate_frozen_task_trees(
@@ -351,7 +295,7 @@ def test_training_recipe_uses_separate_frozen_task_trees(
 
 def _terminal_bench_config(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> TerminalBenchController.Config:
+) -> Controller.Config:
     monkeypatch.setenv("TERMINAL_BENCH_TRAIN_TASKS_ROOT", str(tmp_path / "train"))
     monkeypatch.setenv("TERMINAL_BENCH_EVAL_TASKS_ROOT", str(tmp_path / "eval"))
     return ConfigManager().parse_args(
@@ -384,7 +328,6 @@ def _num_experts(model: object) -> int | None:
     ("name", "trainer_gpus", "num_generators", "gpus_per_generator"),
     [
         ("rl_grpo_qwen35_9b_terminal_bench", 8, 8, 1),
-        ("rl_grpo_qwen35_27b_terminal_bench", 8, 2, 4),
         ("rl_grpo_qwen35_35b_a3b_terminal_bench", 8, 2, 4),
     ],
 )
@@ -447,7 +390,6 @@ def test_recipe_layouts_fit_the_model(
     ("name", "dtype"),
     [
         ("rl_grpo_qwen35_9b_terminal_bench", "float32"),
-        ("rl_grpo_qwen35_27b_terminal_bench", "bfloat16"),
         ("rl_grpo_qwen35_35b_a3b_terminal_bench", "bfloat16"),
     ],
 )
@@ -463,25 +405,3 @@ def test_recipes_share_the_loop_and_differ_in_model_and_precision(
     assert config.async_loop.num_training_steps == 100
     assert config.async_loop.training_sample_builder.drop_zero_std_reward_groups
     assert config.generator.sampling.max_tokens == 16384
-    assert not config.eval_only
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "rl_grpo_qwen35_9b_terminal_bench_eval",
-        "rl_grpo_qwen35_27b_terminal_bench_eval",
-        "rl_grpo_qwen35_35b_a3b_terminal_bench_eval",
-    ],
-)
-def test_eval_recipes_score_the_benchmark_without_training(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Each eval recipe takes no optimizer steps and scores all 89 tasks."""
-    config = _terminal_bench_config(name, tmp_path, monkeypatch)
-    assert config.eval_only
-    assert config.async_loop.num_training_steps == 0
-    assert config.async_loop.validation.num_samples == 89
-    assert config.rollouter.train_dataset.verifiers_taskset.tasks_root == (
-        tmp_path / "eval"
-    )
