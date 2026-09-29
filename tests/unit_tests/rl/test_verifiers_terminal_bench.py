@@ -228,18 +228,22 @@ def test_recipe_layouts_fit_the_model(
 
 
 @pytest.mark.parametrize(
-    ("name", "dtype"),
+    "name",
     [
-        ("rl_grpo_qwen35_9b_terminal_bench", "float32"),
-        ("rl_grpo_qwen35_35b_a3b_terminal_bench", "bfloat16"),
+        "rl_grpo_qwen35_9b_terminal_bench",
+        "rl_grpo_qwen35_35b_a3b_terminal_bench",
     ],
 )
-def test_recipes_share_the_loop_and_differ_in_model_and_precision(
-    name: str, dtype: str, monkeypatch: pytest.MonkeyPatch
+def test_recipes_share_the_loop_and_keep_fp32_master_weights(
+    name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every model trains on the same loop; only size-dependent settings differ."""
+    """Every model trains on the same loop; only size-dependent settings differ.
+
+    Master weights stay fp32 (the default): at a 1e-6 learning rate bf16
+    parameters round most updates away.
+    """
     config = _terminal_bench_config(name, monkeypatch)
-    assert config.trainer.training.dtype == dtype
+    assert config.trainer.training.dtype == "float32"
     assert config.trainer.training.max_context_length == 65536
     assert config.async_loop.num_prompts_per_train_step == 8
     assert config.async_loop.num_samples_per_prompt == 32

@@ -105,18 +105,18 @@ GPUs: 8 for the trainer and 8 for generators.
 | Model | Config | Trainer | Generators | Trainer precision | Generator CUDA graphs |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3.5-9B | `rl_grpo_qwen35_9b_terminal_bench` | FSDP=8 | 8 x 1 GPU | fp32 master weights | `FULL_DECODE_ONLY` |
-| Qwen3.5-35B-A3B | `rl_grpo_qwen35_35b_a3b_terminal_bench` | FSDP=4, TP=2, EP=8 | 2 x 4 GPUs (DP=2, TP=2, EP=4) | full bf16 | off |
+| Qwen3.5-35B-A3B | `rl_grpo_qwen35_35b_a3b_terminal_bench` | FSDP=4, TP=2, EP=8 | 2 x 4 GPUs (DP=2, TP=2, EP=4) | fp32 master weights | off |
 
 - The 35B-A3B layout follows the model shape. It has 2 KV heads and 256 experts:
   TP is capped at 2, trainer EP must be at least TP and divide both the experts
   and `dp_shard * tp`, and the generator's DP axis exists only to supply
   expert-parallel ranks, so its EP equals DP x TP.
-- Full bf16 (`dtype="bfloat16"`) keeps parameters, gradients and optimizer
-  states in bf16 with no fp32 copy. It puts the 35B-A3B model states at roughly
-  35 GB per trainer GPU; fp32 master weights would need about 70 GB before
-  activations. The 9B keeps fp32 master weights. At a 1e-6 learning rate, bf16
-  parameters can round small updates away, so prefer fp32 master weights where
-  the memory allows.
+- Both recipes keep fp32 master weights, the default. For the 35B-A3B that is
+  about 70 GB of model states per trainer GPU across 8 GPUs before activations,
+  so it needs GPUs with well over 80 GB of memory. Training fully in bf16
+  (`dtype="bfloat16"`) would halve that, but at a 1e-6 learning rate bf16
+  parameters round most updates away: in a quick check with weights of standard
+  deviation 0.02, only about 2% of them change per step.
 - The 35B-A3B generator runs without CUDA graphs. The standard MoE token
   dispatcher copies the all-to-all split sizes to the host, and graph capture
   fails on that copy. Re-enable capture together with a dispatcher that avoids

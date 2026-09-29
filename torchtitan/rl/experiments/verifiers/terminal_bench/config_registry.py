@@ -152,8 +152,9 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
     expert parallelism, so its EP equals DP x TP; 256 experts over 4 ranks is 64
     each.
 
-    The trainer trains fully in bf16, about 35 GB of model states per GPU across
-    8 GPUs, where fp32 master weights would need about 70 GB.
+    The trainer keeps fp32 master weights, the default. That is about 70 GB of
+    model states per GPU across 8 GPUs before activations, so it needs GPUs with
+    well over 80 GB of memory.
 
     Generator CUDA graphs are off. The standard MoE token dispatcher copies the
     all-to-all split sizes to the host, which CUDA graph capture does not allow
@@ -216,7 +217,7 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
                 disable_cuda_graphs=True,
                 num_tokens_per_microbatch_per_dp_rank=max_context_length,
                 max_context_length=max_context_length,
-                dtype="bfloat16",
+                dtype="float32",
             ),
             parallelism=ParallelismConfig(
                 data_parallel_replicate_degree=1,
