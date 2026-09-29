@@ -1,7 +1,8 @@
 # Terminal-Bench with Verifiers and TitanRL
 
-This experiment trains a Qwen3.5-9B terminal agent on a frozen Harbor-format task
-tree, and evaluates it on all 89 Terminal-Bench 2.1 tasks. TitanRL schedules
+This experiment trains a Qwen3.5 terminal agent (9B, 27B or 35B-A3B) on a frozen
+Harbor-format task tree, and evaluates it on all 89 Terminal-Bench 2.1 tasks.
+TitanRL schedules
 rollout groups, generates tokens, and trains the model; Verifiers 0.3.1 runs the
 Terminus-2 agent and the Harbor task verifier. It is an experiment, not a new
 TitanRL rollout or sandbox backend.
@@ -122,6 +123,39 @@ Harbor metadata does not specify one; 3 of the 89 TB2.1 tasks use paths other
 than `/app`. Test fixtures are unpacked without restoring the host UID so
 rootless Docker/Podman can run the same in-container grader.
 
+## Model sizes
+
+Three sizes share the task trees, sampling, loop and optimizer settings above.
+Only the checkpoint, the trainer precision, the trainer and generator layouts
+and the generator CUDA graph mode change with the model. Every recipe uses 16
+GPUs: 8 for the trainer and 8 for generators. Each has a matching `_eval`
+config (`rl_grpo_qwen35_<size>_terminal_bench_eval`).
+
+| Model | Training config | Trainer | Generators | Trainer precision | Generator CUDA graphs |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.5-9B | `rl_grpo_qwen35_9b_terminal_bench` | FSDP=8 | 8 x 1 GPU | fp32 master weights | `FULL_DECODE_ONLY` |
+| Qwen3.5-27B | `rl_grpo_qwen35_27b_terminal_bench` | FSDP=4, TP=2 | 2 x 4 GPUs (TP=4) | full bf16 | `FULL_DECODE_ONLY` |
+| Qwen3.5-35B-A3B | `rl_grpo_qwen35_35b_a3b_terminal_bench` | FSDP=4, TP=2, EP=8 | 2 x 4 GPUs (DP=2, TP=2, EP=4) | full bf16 | off |
+
+- The layouts follow the model shapes. The 27B has 4 KV heads, so both TP
+  degrees divide 4. The 35B-A3B has 2 KV heads and 256 experts: TP is capped at
+  2, trainer EP must be at least TP and divide both the experts and
+  `dp_shard * tp`, and the generator's DP axis exists only to supply
+  expert-parallel ranks, so its EP equals DP x TP.
+- Full bf16 (`dtype="bfloat16"`) keeps parameters, gradients and optimizer
+  states in bf16 with no fp32 copy. It puts the 27B and 35B-A3B model states at
+  roughly 27 GB and 35 GB per trainer GPU; fp32 master weights would need about
+  54 GB and 70 GB before activations. The 9B keeps fp32 master weights. At a
+  1e-6 learning rate, bf16 parameters can round small updates away, so prefer
+  fp32 master weights where the memory allows.
+- The 35B-A3B generator runs without CUDA graphs. The standard MoE token
+  dispatcher copies the all-to-all split sizes to the host, and graph capture
+  fails on that copy. Re-enable capture together with a dispatcher that avoids
+  the host read, such as HybridEP with `non_blocking_capacity_factor`.
+- The 27B and 35B-A3B recipes have not been run end to end. The CPU tests check
+  that each layout is consistent with the model's KV heads and experts; they do
+  not check that the layout fits in memory or that rollouts complete.
+
 ## Evaluate a checkpoint
 
 ```bash
@@ -143,7 +177,8 @@ Run with a fresh output directory for each benchmark attempt.
 
 ## Fidelity and open dependencies
 
-The example preserves the colleague branch's Qwen3.5-9B model choice,
+The 9B recipe preserves the colleague branch's Qwen3.5-9B model choice; the 27B
+and 35B-A3B recipes are additions to it. The example preserves the
 Terminus-2 v0.22 scaffold, 120-turn budget, Harbor task instructions, isolated
 per-task environment, in-place verifier, and 0/1 reward. Verifiers reads
 binary grading fixtures directly from the task tree; it does not need the

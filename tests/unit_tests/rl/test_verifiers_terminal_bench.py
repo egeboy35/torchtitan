@@ -347,3 +347,141 @@ def test_training_recipe_uses_separate_frozen_task_trees(
     assert config.rollouter.validation_dataset.verifiers_taskset.tasks_root == (
         tmp_path / "eval"
     )
+
+
+def _terminal_bench_config(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> TerminalBenchController.Config:
+    monkeypatch.setenv("TERMINAL_BENCH_TRAIN_TASKS_ROOT", str(tmp_path / "train"))
+    monkeypatch.setenv("TERMINAL_BENCH_EVAL_TASKS_ROOT", str(tmp_path / "eval"))
+    return ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan.rl.experiments.verifiers.terminal_bench",
+            "--config",
+            name,
+        ]
+    )
+
+
+def _num_kv_heads(model: object) -> int:
+    for layer in model.layers:
+        attention = getattr(layer, "attention", None)
+        if hasattr(attention, "n_kv_heads"):
+            return attention.n_kv_heads
+    raise AssertionError("model has no full-attention layer")
+
+
+def _num_experts(model: object) -> int | None:
+    for layer in model.layers:
+        moe = getattr(layer, "moe", None)
+        if moe is not None:
+            return moe.num_experts
+    return None
+
+
+@pytest.mark.parametrize(
+    ("name", "trainer_gpus", "num_generators", "gpus_per_generator"),
+    [
+        ("rl_grpo_qwen35_9b_terminal_bench", 8, 8, 1),
+        ("rl_grpo_qwen35_27b_terminal_bench", 8, 2, 4),
+        ("rl_grpo_qwen35_35b_a3b_terminal_bench", 8, 2, 4),
+    ],
+)
+def test_recipe_layouts_fit_the_model(
+    name: str,
+    trainer_gpus: int,
+    num_generators: int,
+    gpus_per_generator: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each recipe's trainer and generator layouts respect the model's shape.
+
+    The invariants are the ones a launch would otherwise trip over one at a
+    time: tensor parallelism divides the KV heads in both roles, and for the MoE
+    model expert parallelism divides the experts, is at least the trainer TP
+    degree, and equals DP x TP in the generator. The GPU totals pin the intended
+    16-GPU footprint.
+    """
+    config = _terminal_bench_config(name, tmp_path, monkeypatch)
+    trainer = config.trainer.parallelism
+    generator = config.generator.parallelism
+    num_kv_heads = _num_kv_heads(config.model)
+    num_experts = _num_experts(config.model)
+
+    assert (
+        trainer.data_parallel_replicate_degree
+        * trainer.data_parallel_shard_degree
+        * trainer.tensor_parallel_degree
+        * trainer.context_parallel_degree
+        == trainer_gpus
+    )
+    assert config.num_generators == num_generators
+    assert generator.data_parallel_degree * generator.tensor_parallel_degree == (
+        gpus_per_generator
+    )
+    assert num_kv_heads % trainer.tensor_parallel_degree == 0
+    assert num_kv_heads % generator.tensor_parallel_degree == 0
+
+    if num_experts is None:
+        assert trainer.expert_parallel_degree == 1
+        assert generator.expert_parallel_degree == 1
+        assert config.generator.cuda_graph.mode == "FULL_DECODE_ONLY"
+    else:
+        assert num_experts % trainer.expert_parallel_degree == 0
+        assert trainer.expert_parallel_degree >= trainer.tensor_parallel_degree
+        assert (
+            trainer.data_parallel_shard_degree * trainer.tensor_parallel_degree
+        ) % trainer.expert_parallel_degree == 0
+        assert generator.expert_parallel_degree == (
+            generator.data_parallel_degree * generator.tensor_parallel_degree
+        )
+        assert num_experts % generator.expert_parallel_degree == 0
+        # The standard MoE dispatcher reads split sizes back to the host, which
+        # CUDA graph capture does not allow.
+        assert config.generator.cuda_graph.mode == "NONE"
+
+
+@pytest.mark.parametrize(
+    ("name", "dtype"),
+    [
+        ("rl_grpo_qwen35_9b_terminal_bench", "float32"),
+        ("rl_grpo_qwen35_27b_terminal_bench", "bfloat16"),
+        ("rl_grpo_qwen35_35b_a3b_terminal_bench", "bfloat16"),
+    ],
+)
+def test_recipes_share_the_loop_and_differ_in_model_and_precision(
+    name: str, dtype: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every model trains on the same loop; only size-dependent settings differ."""
+    config = _terminal_bench_config(name, tmp_path, monkeypatch)
+    assert config.trainer.training.dtype == dtype
+    assert config.trainer.training.max_context_length == 65536
+    assert config.async_loop.num_prompts_per_train_step == 8
+    assert config.async_loop.num_samples_per_prompt == 32
+    assert config.async_loop.num_training_steps == 100
+    assert config.async_loop.training_sample_builder.drop_zero_std_reward_groups
+    assert config.generator.sampling.max_tokens == 16384
+    assert not config.eval_only
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "rl_grpo_qwen35_9b_terminal_bench_eval",
+        "rl_grpo_qwen35_27b_terminal_bench_eval",
+        "rl_grpo_qwen35_35b_a3b_terminal_bench_eval",
+    ],
+)
+def test_eval_recipes_score_the_benchmark_without_training(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each eval recipe takes no optimizer steps and scores all 89 tasks."""
+    config = _terminal_bench_config(name, tmp_path, monkeypatch)
+    assert config.eval_only
+    assert config.async_loop.num_training_steps == 0
+    assert config.async_loop.validation.num_samples == 89
+    assert config.rollouter.train_dataset.verifiers_taskset.tasks_root == (
+        tmp_path / "eval"
+    )
