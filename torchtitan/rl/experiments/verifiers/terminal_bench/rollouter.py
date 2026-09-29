@@ -7,7 +7,6 @@
 """Run Terminus-2 and Harbor grading inside one sandbox per rollout."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import verifiers.v1 as vf
 from verifiers.v1.configs.agent import TimeoutConfig as AgentTimeoutConfig
@@ -21,13 +20,13 @@ from torchtitan.rl.examples.verifiers import (
     VerifiersTaskDataset,
 )
 from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
-from torchtitan.rl.experiments.verifiers.terminal_bench.data import (
-    TerminalTasksetConfig,
-)
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     NUM_AGENT_TURNS,
     register_harness_alias,
     TerminalBenchTerminusHarnessConfig,
+)
+from torchtitan.rl.experiments.verifiers.terminal_bench.taskset import (
+    TerminalTasksetConfig,
 )
 from torchtitan.rl.rubric import Rubric
 
@@ -49,39 +48,26 @@ class TerminalBenchRollouter(VerifiersRollouter):
 
 
 def terminal_bench_rollouter_config(
-    train_tasks_root: Path,
-    validation_tasks_root: Path,
-    *,
-    train_images_path: Path | None = None,
-    validation_images_path: Path | None = None,
+    train_dataset: str, validation_dataset: str
 ) -> TerminalBenchRollouter.Config:
-    """Select frozen task trees; never mix benchmark tasks into training."""
-    train_root = train_tasks_root.resolve()
-    validation_root = validation_tasks_root.resolve()
-    if train_root.is_relative_to(validation_root) or validation_root.is_relative_to(
-        train_root
-    ):
+    """Select Harbor datasets by id; never mix benchmark tasks into training."""
+    if train_dataset == validation_dataset:
         raise ValueError(
-            "Training and Terminal-Bench evaluation must use different trees"
+            "Training and Terminal-Bench evaluation must use different datasets"
         )
 
     taskset_id = register_local_taskset_alias(TerminalTasksetConfig.__module__)
     return TerminalBenchRollouter.Config(
         train_dataset=VerifiersTaskDataset.Config(
             verifiers_taskset=TerminalTasksetConfig(
-                id=taskset_id,
-                tasks_root=train_tasks_root,
-                image_overrides_path=train_images_path,
+                id=taskset_id, dataset=train_dataset
             ),
             seed=42,
             shuffle=True,
         ),
         validation_dataset=VerifiersTaskDataset.Config(
             verifiers_taskset=TerminalTasksetConfig(
-                id=taskset_id,
-                tasks_root=validation_tasks_root,
-                expected_num_tasks=89,
-                image_overrides_path=validation_images_path,
+                id=taskset_id, dataset=validation_dataset
             ),
             seed=99,
             shuffle=False,

@@ -6,14 +6,13 @@
 
 """Qwen3.5 terminal-agent recipes using Verifiers and TitanRL.
 
-Both recipes read the same environment variables: ``TERMINAL_BENCH_TRAIN_TASKS_ROOT``
-and ``TERMINAL_BENCH_EVAL_TASKS_ROOT`` (frozen Harbor task trees, required), and
-``TERMINAL_BENCH_TRAIN_IMAGES`` and ``TERMINAL_BENCH_EVAL_IMAGES`` (image override
-manifests, optional).
+Both recipes read the same two environment variables, each a Harbor dataset id
+(``org/name`` or ``org/name@ref``, downloaded and cached by the ``harbor`` CLI):
+``TERMINAL_BENCH_TRAIN_DATASET`` for training and ``TERMINAL_BENCH_EVAL_DATASET``
+for the Terminal-Bench 2.1 validation set. They must differ.
 """
 
 import os
-from pathlib import Path
 
 from renderers import Qwen35RendererConfig
 
@@ -54,8 +53,6 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
         attn_backend="varlen",
         converters=[LMHeadCastConverter.Config()],
     )
-    train_images = os.environ.get("TERMINAL_BENCH_TRAIN_IMAGES")
-    eval_images = os.environ.get("TERMINAL_BENCH_EVAL_IMAGES")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3.5-9B",
@@ -68,10 +65,8 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
             validation=ValidationConfig(num_samples=89),
         ),
         rollouter=terminal_bench_rollouter_config(
-            Path(os.environ["TERMINAL_BENCH_TRAIN_TASKS_ROOT"]),
-            Path(os.environ["TERMINAL_BENCH_EVAL_TASKS_ROOT"]),
-            train_images_path=Path(train_images) if train_images else None,
-            validation_images_path=Path(eval_images) if eval_images else None,
+            os.environ["TERMINAL_BENCH_TRAIN_DATASET"],
+            os.environ["TERMINAL_BENCH_EVAL_DATASET"],
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(
@@ -173,8 +168,6 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
         attn_backend="varlen",
         converters=[LMHeadCastConverter.Config()],
     )
-    train_images = os.environ.get("TERMINAL_BENCH_TRAIN_IMAGES")
-    eval_images = os.environ.get("TERMINAL_BENCH_EVAL_IMAGES")
     return Controller.Config(
         model=model_config,
         hf_assets_path="torchtitan/rl/example_checkpoint/Qwen3.5-35B-A3B",
@@ -187,10 +180,8 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             validation=ValidationConfig(num_samples=89),
         ),
         rollouter=terminal_bench_rollouter_config(
-            Path(os.environ["TERMINAL_BENCH_TRAIN_TASKS_ROOT"]),
-            Path(os.environ["TERMINAL_BENCH_EVAL_TASKS_ROOT"]),
-            train_images_path=Path(train_images) if train_images else None,
-            validation_images_path=Path(eval_images) if eval_images else None,
+            os.environ["TERMINAL_BENCH_TRAIN_DATASET"],
+            os.environ["TERMINAL_BENCH_EVAL_DATASET"],
         ),
         renderer=from_renderers(
             Qwen35RendererConfig(

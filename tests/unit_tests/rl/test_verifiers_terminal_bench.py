@@ -7,11 +7,9 @@
 """CPU checks for the Terminal-Bench Verifiers recipe."""
 
 import ast
-import asyncio
 import json
-import os
-from pathlib import Path
-from types import SimpleNamespace
+import subprocess
+import sys
 
 import pytest
 
@@ -22,9 +20,7 @@ import verifiers.v1 as vf
 from torchtitan.config.manager import ConfigManager
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.rl.controller import Controller
-from torchtitan.rl.examples.verifiers import VerifiersTaskDataset
-from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
-from torchtitan.rl.experiments.verifiers.terminal_bench import data
+from torchtitan.rl.experiments.verifiers.terminal_bench import taskset
 from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
     TerminalBenchTerminusHarness,
     TerminalBenchTerminusHarnessConfig,
@@ -33,191 +29,12 @@ from torchtitan.rl.experiments.verifiers.terminal_bench.harness import (
 from torchtitan.rl.experiments.verifiers.terminal_bench.rollouter import (
     terminal_bench_rollouter_config,
 )
-from verifiers.v1.errors import TaskError
-from verifiers.v1.runtimes import provision_runtime
 from verifiers.v1.serve import env_config_data
-from verifiers.v1.tasksets.harbor import HarborData, HarborEnvConfig
+from verifiers.v1.tasksets.harbor import HarborEnvConfig
 from verifiers.v1.utils.loaders import load_harness, resolve_env_config
 
-
-def _task_dir(root: Path, name: str, *, instruction: bool = True) -> None:
-    task = root / "tasks" / name
-    task.mkdir(parents=True)
-    (task / "task.toml").write_text(
-        'schema_version = "1.1"\n[environment]\ndocker_image = "python:3.12-slim"\n'
-    )
-    (task / "tests").mkdir()
-    (task / "tests" / "test.sh").write_text("echo 1 > /logs/verifier/reward.txt\n")
-    if instruction:
-        (task / "instruction.md").write_text("Solve it")
-
-
-def test_local_taskset_is_ordered_and_requires_complete_benchmark(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _task_dir(tmp_path, "b")
-    _task_dir(tmp_path, "a")
-    _task_dir(tmp_path, "incomplete", instruction=False)
-    monkeypatch.setattr(
-        data,
-        "parse_task",
-        lambda task_dir, idx, config: HarborData(
-            idx=idx,
-            name=task_dir.name,
-            prompt="Solve it",
-            image="python:3.12-slim",
-            task_dir=str(task_dir),
-        ),
-    )
-
-    config = data.TerminalTasksetConfig(
-        id="local_terminal_tasks", tasks_root=tmp_path, expected_num_tasks=2
-    )
-    tasks = list(data.TerminalTaskset(config).load())
-    assert [(task.data.idx, task.data.name) for task in tasks] == [
-        (0, "a"),
-        (1, "b"),
-    ]
-    with pytest.raises(ValueError, match="Expected 89 Harbor tasks"):
-        list(
-            data.TerminalTaskset(
-                config.model_copy(update={"expected_num_tasks": 89})
-            ).load()
-        )
-
-
-def test_local_taskset_rejects_missing_root(tmp_path: Path) -> None:
-    config = data.TerminalTasksetConfig(
-        id="local_terminal_tasks", tasks_root=tmp_path / "absent"
-    )
-    with pytest.raises(ValueError, match="not a directory"):
-        list(data.TerminalTaskset(config).load())
-
-
-def test_harbor_task_data_reaches_verifiers_dataset(tmp_path: Path) -> None:
-    pytest.importorskip("harbor")
-    _task_dir(tmp_path, "check-fixtures")
-    assert data.TerminalTaskset.task_type() is data.TerminalTask
-    alias = register_local_taskset_alias(data.__name__)
-    dataset = VerifiersTaskDataset.Config(
-        verifiers_taskset=data.TerminalTasksetConfig(
-            id=alias, tasks_root=tmp_path, expected_num_tasks=1
-        ),
-        shuffle=False,
-    ).build()
-    sample = next(dataset).verifiers_task_data
-    assert sample["prompt"] == "Solve it"
-    assert sample["image"] == "python:3.12-slim"
-    assert sample["task_dir"] == str(tmp_path / "tasks" / "check-fixtures")
-
-
-def test_image_overrides_keep_the_task_tree_unchanged(tmp_path: Path) -> None:
-    pytest.importorskip("harbor")
-    _task_dir(tmp_path, "override")
-    image_map = tmp_path / "images.json"
-    image_map.write_text(json.dumps({"override": "registry.example/with-tmux:v1"}))
-    config = data.TerminalTasksetConfig(
-        id="terminal_tasks", tasks_root=tmp_path, image_overrides_path=image_map
-    )
-    task = next(data.TerminalTaskset(config).load())
-    assert task.data.image == "registry.example/with-tmux:v1"
-    assert (
-        'docker_image = "python:3.12-slim"'
-        in (tmp_path / "tasks" / "override" / "task.toml").read_text()
-    )
-    task_dir = tmp_path / "tasks" / "override"
-    (task_dir / "task.toml").write_text('schema_version = "1.1"\n')
-    (task_dir / "environment").mkdir()
-    (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.12-slim\n")
-    assert next(data.TerminalTaskset(config).load()).data.image == (
-        "registry.example/with-tmux:v1"
-    )
-    with pytest.raises(ValueError, match="Dockerfile"):
-        list(
-            data.TerminalTaskset(
-                config.model_copy(update={"image_overrides_path": None})
-            ).load()
-        )
-    image_map.write_text("{}")
-    with pytest.raises(ValueError, match="No image override"):
-        list(data.TerminalTaskset(config).load())
-
-
-def test_missing_tmux_reports_a_preparation_error(tmp_path: Path) -> None:
-    pytest.importorskip("harbor")
-    _task_dir(tmp_path, "missing-tmux")
-    task = next(
-        data.TerminalTaskset(
-            data.TerminalTasksetConfig(id="terminal_tasks", tasks_root=tmp_path)
-        ).load()
-    )
-
-    class RuntimeWithoutTmux:
-        async def run(self, argv, env):
-            return SimpleNamespace(exit_code=1)
-
-    with pytest.raises(TaskError, match="lacks tmux"):
-        asyncio.run(task.setup(RuntimeWithoutTmux()))
-
-
-@pytest.mark.skipif(
-    os.environ.get("TERMINAL_BENCH_DOCKER_SMOKE") != "1",
-    reason="requires Docker and a pullable test image",
-)
-def test_harbor_verifier_grades_in_docker(tmp_path: Path) -> None:
-    pytest.importorskip("harbor")
-    _task_dir(tmp_path, "docker-grading")
-    task = next(
-        data.TerminalTaskset(
-            data.TerminalTasksetConfig(id="terminal_tasks", tasks_root=tmp_path)
-        ).load()
-    )
-    assert task.data.image is not None
-
-    async def grade() -> float | dict[str, float]:
-        async with provision_runtime(
-            vf.DockerConfig(image=task.data.image, workdir="/"),
-            env=task.runtime_env(),
-        ) as runtime:
-            await runtime.prepare_setup()
-            await runtime.prepare_execution([])
-            return await task.solved(
-                runtime, SimpleNamespace(record_metrics=lambda metrics: None)
-            )
-
-    assert asyncio.run(grade()) == 1.0
-
-
-def test_published_image_workdir_is_preserved(tmp_path: Path) -> None:
-    dockerfile = tmp_path / "environment" / "Dockerfile"
-    dockerfile.parent.mkdir()
-    dockerfile.write_text("FROM python:3.12\nWORKDIR /app\nWORKDIR /app/project\n")
-    assert data._dockerfile_workdir(tmp_path) == "/app/project"
-
-
-def test_published_terminal_bench_tree_if_available(tmp_path: Path) -> None:
-    root = os.environ.get("TERMINAL_BENCH_PUBLIC_TASKS_ROOT")
-    if not root:
-        pytest.skip("set TERMINAL_BENCH_PUBLIC_TASKS_ROOT to a pinned 2.1 task tree")
-
-    task_dirs = [path.parent for path in Path(root).rglob("task.toml")]
-    assert len(task_dirs) == 89
-    image_map = tmp_path / "images.json"
-    image_map.write_text(
-        json.dumps({task_dir.name: "python:3.12-slim" for task_dir in task_dirs})
-    )
-    tasks = list(
-        data.TerminalTaskset(
-            data.TerminalTasksetConfig(
-                id="local_terminal_tasks",
-                tasks_root=Path(root),
-                image_overrides_path=image_map,
-                expected_num_tasks=89,
-            )
-        ).load()
-    )
-    assert len(tasks) == 89
-    assert len({task.data.name for task in tasks}) == 89
+TRAIN_DATASET = "org/train-tasks"
+EVAL_DATASET = "terminal-bench/terminal-bench-2-1"
 
 
 def test_terminus_program_keeps_coworker_xml_scaffold() -> None:
@@ -228,12 +45,8 @@ def test_terminus_program_keeps_coworker_xml_scaffold() -> None:
     assert source.count("max_turns=120") == 1
 
 
-def test_agent_runs_inside_docker_and_verifier_uses_same_taskset(
-    tmp_path: Path,
-) -> None:
-    config = terminal_bench_rollouter_config(
-        tmp_path / "train", tmp_path / "terminal-bench-2.1"
-    )
+def test_agent_runs_inside_docker_and_verifier_uses_same_taskset() -> None:
+    config = terminal_bench_rollouter_config(TRAIN_DATASET, EVAL_DATASET)
     environment = config.verifiers_env_server.environment
 
     assert isinstance(environment, HarborEnvConfig)
@@ -243,8 +56,9 @@ def test_agent_runs_inside_docker_and_verifier_uses_same_taskset(
     assert environment.agent.max_turns == 120
     assert environment.agent.timeout.rollout == 7200
     assert environment.taskset == config.train_dataset.verifiers_taskset
-    assert config.validation_dataset.verifiers_taskset.expected_num_tasks == 89
-    assert config.verifiers_env_server.local_taskset_module == data.__name__
+    assert config.train_dataset.verifiers_taskset.dataset == TRAIN_DATASET
+    assert config.validation_dataset.verifiers_taskset.dataset == EVAL_DATASET
+    assert config.verifiers_env_server.local_taskset_module == taskset.__name__
     worker_config = resolve_env_config(env_config_data(environment))
     assert isinstance(worker_config.agent.harness, TerminalBenchTerminusHarnessConfig)
     assert isinstance(
@@ -252,26 +66,59 @@ def test_agent_runs_inside_docker_and_verifier_uses_same_taskset(
     )
 
 
-def test_training_cannot_read_benchmark_as_training_data(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="different trees"):
-        terminal_bench_rollouter_config(tmp_path, tmp_path)
-    with pytest.raises(ValueError, match="different trees"):
-        terminal_bench_rollouter_config(tmp_path, tmp_path / "eval")
+def test_worker_process_resolves_the_harness_from_a_fresh_interpreter() -> None:
+    """The env-server worker shares no ``sys.modules`` with the controller.
+
+    It imports only the local taskset module and then rebuilds the environment
+    config from JSON, so that one import must be enough to make the harness id
+    resolvable. Resolving in the test process would pass regardless, because the
+    controller side has already registered the alias there.
+    """
+    config = terminal_bench_rollouter_config(TRAIN_DATASET, EVAL_DATASET)
+    environment = json.dumps(env_config_data(config.verifiers_env_server.environment))
+    worker = f"""
+import json
+from torchtitan.rl.examples.verifiers.data import register_local_taskset_alias
+from verifiers.v1.utils.loaders import load_harness, resolve_env_config
+
+environment = json.loads({environment!r})
+environment["taskset"]["id"] = register_local_taskset_alias(
+    {config.verifiers_env_server.local_taskset_module!r}
+)
+env_config = resolve_env_config(environment)
+print(type(load_harness(env_config.agent.harness)).__name__)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", worker], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().endswith("TerminalBenchTerminusHarness")
 
 
-def test_training_recipe_uses_separate_frozen_task_trees(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("TERMINAL_BENCH_TRAIN_TASKS_ROOT", str(tmp_path / "train"))
-    monkeypatch.setenv("TERMINAL_BENCH_EVAL_TASKS_ROOT", str(tmp_path / "eval"))
-    config = ConfigManager().parse_args(
+def test_training_cannot_read_benchmark_as_training_data() -> None:
+    with pytest.raises(ValueError, match="different datasets"):
+        terminal_bench_rollouter_config(EVAL_DATASET, EVAL_DATASET)
+
+
+def _terminal_bench_config(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> Controller.Config:
+    monkeypatch.setenv("TERMINAL_BENCH_TRAIN_DATASET", TRAIN_DATASET)
+    monkeypatch.setenv("TERMINAL_BENCH_EVAL_DATASET", EVAL_DATASET)
+    return ConfigManager().parse_args(
         [
             "--module",
             "torchtitan.rl.experiments.verifiers.terminal_bench",
             "--config",
-            "rl_grpo_qwen35_9b_terminal_bench",
+            name,
         ]
     )
+
+
+def test_training_recipe_uses_separate_datasets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _terminal_bench_config("rl_grpo_qwen35_9b_terminal_bench", monkeypatch)
     assert config.async_loop.num_training_steps == 100
     assert config.async_loop.num_samples_per_prompt == 32
     assert config.trainer.training.max_context_length == 65536
@@ -285,27 +132,22 @@ def test_training_recipe_uses_separate_frozen_task_trees(
     assert config.generator.cuda_graph.mode == "FULL_DECODE_ONLY"
     assert config.num_generators == 8
     assert config.generator.parallelism.data_parallel_degree == 1
-    assert config.rollouter.train_dataset.verifiers_taskset.tasks_root == (
-        tmp_path / "train"
-    )
-    assert config.rollouter.validation_dataset.verifiers_taskset.tasks_root == (
-        tmp_path / "eval"
-    )
+    assert config.rollouter.train_dataset.verifiers_taskset.dataset == TRAIN_DATASET
+    assert config.rollouter.validation_dataset.verifiers_taskset.dataset == EVAL_DATASET
 
 
-def _terminal_bench_config(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Controller.Config:
-    monkeypatch.setenv("TERMINAL_BENCH_TRAIN_TASKS_ROOT", str(tmp_path / "train"))
-    monkeypatch.setenv("TERMINAL_BENCH_EVAL_TASKS_ROOT", str(tmp_path / "eval"))
-    return ConfigManager().parse_args(
-        [
-            "--module",
-            "torchtitan.rl.experiments.verifiers.terminal_bench",
-            "--config",
-            name,
-        ]
-    )
+def test_recipes_require_both_dataset_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TERMINAL_BENCH_TRAIN_DATASET", raising=False)
+    monkeypatch.delenv("TERMINAL_BENCH_EVAL_DATASET", raising=False)
+    with pytest.raises(KeyError, match="TERMINAL_BENCH_TRAIN_DATASET"):
+        ConfigManager().parse_args(
+            [
+                "--module",
+                "torchtitan.rl.experiments.verifiers.terminal_bench",
+                "--config",
+                "rl_grpo_qwen35_9b_terminal_bench",
+            ]
+        )
 
 
 def _num_kv_heads(model: object) -> int:
@@ -336,7 +178,6 @@ def test_recipe_layouts_fit_the_model(
     trainer_gpus: int,
     num_generators: int,
     gpus_per_generator: int,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each recipe's trainer and generator layouts respect the model's shape.
@@ -347,7 +188,7 @@ def test_recipe_layouts_fit_the_model(
     degree, and equals DP x TP in the generator. The GPU totals pin the intended
     16-GPU footprint.
     """
-    config = _terminal_bench_config(name, tmp_path, monkeypatch)
+    config = _terminal_bench_config(name, monkeypatch)
     trainer = config.trainer.parallelism
     generator = config.generator.parallelism
     num_kv_heads = _num_kv_heads(config.model)
@@ -394,10 +235,10 @@ def test_recipe_layouts_fit_the_model(
     ],
 )
 def test_recipes_share_the_loop_and_differ_in_model_and_precision(
-    name: str, dtype: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    name: str, dtype: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every model trains on the same loop; only size-dependent settings differ."""
-    config = _terminal_bench_config(name, tmp_path, monkeypatch)
+    config = _terminal_bench_config(name, monkeypatch)
     assert config.trainer.training.dtype == dtype
     assert config.trainer.training.max_context_length == 65536
     assert config.async_loop.num_prompts_per_train_step == 8
