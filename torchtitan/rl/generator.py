@@ -455,16 +455,17 @@ class RequestDispatcher:
     def rank0_stamp_min_policy_version(
         self,
         requests_per_dp_rank: list[list[GenerationRequest]],
-        policy_version: int,
     ) -> None:
-        """RANK 0: stamp the admitted (sampling) version on every future in this STEP
-        decision, across all DP ranks. Rank 0 owns the futures regardless of which DP
-        rank serves the request, so it stamps them all here."""
+        """RANK 0: stamp each request's cache policy version as the min version on every
+        future in this STEP decision, across all DP ranks. The request may reuse KV cached
+        under that version, so it is the oldest policy the completion can depend on. Rank 0
+        owns the futures regardless of which DP rank serves the request, so it stamps them
+        all here."""
         for dp_requests in requests_per_dp_rank:
             for request in dp_requests:
                 self._rank0_generation_futures[
                     request.request_id
-                ].min_policy_version = policy_version
+                ].min_policy_version = request.cache_policy_version
 
     def setup(self) -> None:
         """One-time setup before the engine loop starts (DP>1): distribute rank 0's
@@ -756,11 +757,11 @@ class VLLMGenerator(Configurable):
         reset_kv_cache_on_weight_sync: bool = False
         """Reset cached and running-request KV after each weight sync.
 
-        The default preserves in-flight requests and their KV. Existing rollout
-        groups retain their cache salt across updates; new groups use the version
-        installed when the router first dispatches them.
-        Enable this to clear prefix-cache entries and preempt running requests;
-        vLLM then recomputes their KV under the new weights when they resume."""
+        The default preserves in-flight requests and their KV: a rollout keeps the
+        cache salt pinned when this generator first admitted it, so its later turns
+        reuse its KV across weight syncs, while new rollouts use the current version.
+        Enable this to clear prefix-cache entries and preempt running requests; vLLM
+        then recomputes their KV under the new weights when they resume."""
 
         vllm_stat_logger: Annotated[
             VllmOtelStatLogger.Config | None, tyro.conf.Suppress
@@ -979,6 +980,11 @@ class VLLMGenerator(Configurable):
             )
 
         self.policy_version = 0
+        # RANK 0: group id -> routing session id -> policy version the session's cache
+        # salt is pinned to, set at the session's first admission. Only the controller
+        # knows when a rollout has no more turns, so entries live until it calls
+        # `release_groups`.
+        self._cache_policy_versions: dict[int, dict[str, int]] = {}
 
         # --- Continuous-batching state (see the class docstring) ---
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
@@ -1059,8 +1065,8 @@ class VLLMGenerator(Configurable):
         prompt_token_ids: list[int],
         *,
         request_id: str,
+        group_id: int,
         routing_session_id: str,
-        cache_policy_version: int | None,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
     ) -> Completion:
@@ -1074,9 +1080,9 @@ class VLLMGenerator(Configurable):
         Args:
             prompt_token_ids: One tokenized prompt `[token_ids]`.
             request_id: Unique id for this request, echoed on the `Completion`.
-            routing_session_id: Stable session key for in-mesh DP routing.
-            cache_policy_version: Group cache version, or None after rerouting
-                to choose the destination's local version at engine admission.
+            group_id: Rollout group id; `release_groups` drops the group's cache salts.
+            routing_session_id: Stable session key for in-mesh DP routing. Requests of
+                one session share a prefix cache salt.
             sampling_config: Optional per-call override for the generator's
                 default SamplingConfig.
             metrics_prefix: Namespace prepended to every metric key on the returned
@@ -1088,8 +1094,8 @@ class VLLMGenerator(Configurable):
             completion = await generator.slice(hosts=0, gpus=0).generate.call_one(
                 [1, 2, 3],
                 request_id="step=3/group=0/sample=0/turn=0",
+                group_id=0,
                 routing_session_id="group=0/rollout=0",
-                cache_policy_version=None,
             )
         """
         self._rank0_check_engine_loop_running("generate")
@@ -1111,8 +1117,8 @@ class VLLMGenerator(Configurable):
                     request_id=request_id,
                     prompt_token_ids=prompt_token_ids,
                     sampling=sampling,
+                    group_id=group_id,
                     routing_session_id=routing_session_id,
-                    cache_policy_version=cache_policy_version,
                 )
             )
             # Wakes the engine loop only if it is idle in `_decide_next_action`.
@@ -1177,7 +1183,7 @@ class VLLMGenerator(Configurable):
                     # The way to do it is probably to change to RequestOutputKind.CUMULATIVE and mark per token.
                     if self._rank == 0:
                         self._request_dispatcher.rank0_stamp_min_policy_version(
-                            decision.requests_per_dp_rank, self.policy_version
+                            decision.requests_per_dp_rank
                         )
                     # Admit only this rank's DP replica slice. TP ranks in the same
                     # replica compute the same _dp_rank, so they add the identical
@@ -1192,7 +1198,7 @@ class VLLMGenerator(Configurable):
                             [
                                 {
                                     "prompt_token_ids": request.prompt_token_ids,
-                                    "cache_salt": self._cache_salt(request),
+                                    "cache_salt": str(request.cache_policy_version),
                                 }
                                 for request in local_requests
                             ]
@@ -1256,6 +1262,10 @@ class VLLMGenerator(Configurable):
                 self._queued_generation_requests,
                 [],
             )
+            for request in queued:
+                request.cache_policy_version = self._cache_policy_versions.setdefault(
+                    request.group_id, {}
+                ).setdefault(request.routing_session_id, self.policy_version)
             return LoopDecision(
                 action=LoopAction.STEP,
                 requests_per_dp_rank=self._request_dispatcher.rank0_route(queued),
@@ -1270,13 +1280,6 @@ class VLLMGenerator(Configurable):
                 self._pull_model_state_dict_future.set_exception(exc)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
-
-    def _cache_salt(self, request: GenerationRequest) -> str:
-        """vLLM cache salt for ``request``: the version the router chose, or this
-        generator's installed version when the router passed None."""
-        if request.cache_policy_version is None:
-            return str(self.policy_version)
-        return str(request.cache_policy_version)
 
     def _build_sampling_params(self, sampling: SamplingConfig) -> SamplingParams:
         """Translate a `SamplingConfig` into vLLM `SamplingParams` (n=1).
@@ -1302,6 +1305,15 @@ class VLLMGenerator(Configurable):
         )
 
     @sl.log_trace_span("pull_model_state_dict")
+    async def release_groups(self, group_ids: list[int]) -> None:
+        """Drop the pinned cache salts of finished rollout groups.
+
+        Args:
+            group_ids: Groups with no more generation calls.
+        """
+        for group_id in group_ids:
+            self._cache_policy_versions.pop(group_id, None)
+
     async def pull_model_state_dict(self, version: int) -> None:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
@@ -1349,6 +1361,7 @@ class VLLMGenerator(Configurable):
         model.model.load_state_dict(model_sd, strict=False)
         self.policy_version = version
         if self.config.reset_kv_cache_on_weight_sync:
+            self._cache_policy_versions.clear()
             self._engine.reset_prefix_cache(
                 reset_running_requests=True,
             )
@@ -1441,8 +1454,10 @@ class GenerationRequest:
     request_id: str
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling: SamplingConfig
+    group_id: int
     routing_session_id: str
-    cache_policy_version: int | None
+    cache_policy_version: int = field(init=False)
+    """Policy version salting this request's prefix cache; rank 0 sets it at admission."""
 
 
 @dataclass(kw_only=True, slots=True)

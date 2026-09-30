@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+import torch.distributed as dist
 
 from torchtitan.components.optimizer import AdamW
 from torchtitan.config import DebugConfig
@@ -267,43 +268,50 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     asyncio.run(generator._engine_loop())
 
 
-@pytest.mark.parametrize("cache_policy_version", [None, 6])
-def test_admission_uses_local_version_for_new_rollouts(
-    monkeypatch, cache_policy_version
-):
-    generator = _generator()
-    engine = cast(_FakeEngine, generator._engine)
+def _generation_request(request_id: str, *, cache_policy_version: int):
     request = GenerationRequest(
-        request_id="r0",
+        request_id=request_id,
         prompt_token_ids=[1, 2],
         sampling=SamplingConfig(),
+        group_id=3,
         routing_session_id="group=3/rollout=0",
-        cache_policy_version=cache_policy_version,
     )
+    request.cache_policy_version = cache_policy_version
+    return request
+
+
+def test_admission_salts_prompt_with_cache_policy_version(monkeypatch):
+    # The pinned version (6), not the installed one (7), salts the prefix cache.
+    generator = _generator()
+    engine = cast(_FakeEngine, generator._engine)
+    request = _generation_request("r0", cache_policy_version=6)
 
     _admit_through_engine_loop(monkeypatch, generator, [request])
 
     _, kwargs = engine.add_requests[0]
-    assert kwargs["prompt"]["cache_salt"] == (
-        "7" if cache_policy_version is None else "6"
+    assert kwargs["prompt"]["cache_salt"] == "6"
+
+
+def test_min_policy_version_is_cache_policy_version():
+    # A request may reuse KV cached under its pinned version, so that version bounds
+    # the completion's staleness.
+    dispatcher = _dispatcher()
+    dispatcher._rank0_generation_futures = {
+        "r0": SimpleNamespace(min_policy_version=None),
+        "r1": SimpleNamespace(min_policy_version=None),
+    }
+
+    dispatcher.rank0_stamp_min_policy_version(
+        [
+            [
+                _generation_request("r0", cache_policy_version=4),
+                _generation_request("r1", cache_policy_version=6),
+            ]
+        ]
     )
 
-
-def test_new_request_uses_version_installed_after_queueing(monkeypatch):
-    generator = _generator()
-    engine = cast(_FakeEngine, generator._engine)
-    request = GenerationRequest(
-        request_id="r0",
-        prompt_token_ids=[1, 2],
-        sampling=SamplingConfig(),
-        routing_session_id="group=3/rollout=0",
-        cache_policy_version=None,
-    )
-
-    generator.policy_version = 8
-    _admit_through_engine_loop(monkeypatch, generator, [request])
-
-    assert engine.add_requests[0][1]["prompt"]["cache_salt"] == "8"
+    assert dispatcher._rank0_generation_futures["r0"].min_policy_version == 4
+    assert dispatcher._rank0_generation_futures["r1"].min_policy_version == 6
 
 
 @pytest.mark.parametrize("reset_kv_cache", [False, True])
@@ -314,6 +322,7 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
         generator = _generator()
         engine = cast(_FakeEngine, generator._engine)
         generator.config.reset_kv_cache_on_weight_sync = reset_kv_cache
+        generator._cache_policy_versions = {3: {"group=3/rollout=0": 7}}
         generator._pull_model_state_dict_future = None
         generator._model_state_dict_pull_request = None
         model = SimpleNamespace(
@@ -334,6 +343,9 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
         assert generator.policy_version == 8
         expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
         assert engine.reset_prefix_cache_calls == expected
+        # Pins survive a pull unless the cache they point at was reset.
+        expected_pins = {} if reset_kv_cache else {3: {"group=3/rollout=0": 7}}
+        assert generator._cache_policy_versions == expected_pins
 
     asyncio.run(run())
 

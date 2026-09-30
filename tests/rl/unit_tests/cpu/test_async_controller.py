@@ -17,147 +17,14 @@ from torchtitan.rl.components.work_buffer import (
     RolloutGroupWork,
     RolloutGroupWorkBuffer,
 )
-from torchtitan.rl.controller import Controller
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.observability.controller import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
-    compute_rollout_metrics,
     MetricsTimer,
 )
-from torchtitan.rl.rollout import Rollout, RolloutGroup, RolloutStatus, RolloutTurn
-from torchtitan.rl.types import (
-    Completion,
-    RolloutTurnID,
-    TrainingSample,
-    TrainingSampleGroup,
-)
-
-
-@pytest.mark.parametrize("fail_group", [False, True])
-def test_group_routes_with_its_group_id_and_releases_routing_state(
-    fail_group: bool,
-) -> None:
-    class _GenerateEndpoint:
-        def __init__(self):
-            self.calls = []
-
-        async def call_one(self, prompt_token_ids, **kwargs):
-            self.calls.append(kwargs)
-            return Completion(
-                min_policy_version=7,
-                max_policy_version=7,
-                request_id=kwargs["request_id"],
-                token_ids=[3],
-                token_logprobs=[-0.1],
-            )
-
-    class _FinishEndpoint:
-        def __init__(self):
-            self.calls = []
-
-        async def call_one(self, group_id):
-            self.calls.append(group_id)
-
-    class _Rollouter:
-        async def run_group_rollouts(self, *, generate_fn, group_id, **kwargs):
-            await generate_fn(
-                [1, 2],
-                request_id=f"group={group_id}/rollout=0/turn=0",
-                routing_session_id=f"group={group_id}/rollout=0",
-            )
-            if fail_group:
-                raise RuntimeError("rollout failed")
-            return RolloutGroup(group_id=group_id, rollouts=[])
-
-    async def run() -> None:
-        controller = Controller.__new__(Controller)
-        generate_endpoint = _GenerateEndpoint()
-        finish_endpoint = _FinishEndpoint()
-        controller.generator_router = type(
-            "Router",
-            (),
-            {"generate": generate_endpoint, "finish_group": finish_endpoint},
-        )()
-        controller._rollouter = _Rollouter()
-        if fail_group:
-            with pytest.raises(RuntimeError, match="rollout failed"):
-                await controller._run_group_rollouts(
-                    metrics_prefix="generator",
-                    sample=object(),
-                    group_id=3,
-                    group_size=1,
-                    sampling=object(),
-                )
-        else:
-            await controller._run_group_rollouts(
-                metrics_prefix="generator",
-                sample=object(),
-                group_id=3,
-                group_size=1,
-                sampling=object(),
-            )
-        assert [kwargs["routing_group_id"] for kwargs in generate_endpoint.calls] == [3]
-        assert finish_endpoint.calls == [3]
-
-    asyncio.run(run())
-
-
-def test_finish_group_failure_keeps_rollout_result() -> None:
-    class _FailingFinishEndpoint:
-        async def call_one(self, group_id):
-            raise RuntimeError("router unavailable")
-
-    class _Rollouter:
-        async def run_group_rollouts(self, *, group_id, **kwargs):
-            return RolloutGroup(group_id=group_id, rollouts=[])
-
-    async def run() -> None:
-        controller = Controller.__new__(Controller)
-        controller.generator_router = type(
-            "Router", (), {"finish_group": _FailingFinishEndpoint()}
-        )()
-        controller._rollouter = _Rollouter()
-        group = await controller._run_group_rollouts(
-            metrics_prefix="generator",
-            sample=object(),
-            group_id=3,
-            group_size=1,
-            sampling=object(),
-        )
-        assert group.group_id == 3
-
-    asyncio.run(run())
-
-
-def test_group_start_version_spread_reports_mixed_siblings() -> None:
-    rollouts = [
-        Rollout(
-            group_id=3,
-            rollout_id=rollout_id,
-            status=RolloutStatus.COMPLETED,
-            turns=[
-                RolloutTurn(
-                    rollout_id=RolloutTurnID(
-                        group_id=3, rollout_id=rollout_id, turn_id=0
-                    ),
-                    prompt_token_ids=[1],
-                    completion_token_ids=[2],
-                    completion_logprobs=[-0.1],
-                    min_policy_version=version,
-                    max_policy_version=version,
-                )
-            ],
-        )
-        for rollout_id, version in enumerate([7, 8])
-    ]
-
-    metric = next(
-        metric
-        for metric in compute_rollout_metrics("rollout", rollouts)
-        if metric.key == "rollout/group_start_policy_version_spread"
-    )
-    assert metric.value.value == 1.0
+from torchtitan.rl.rollout import RolloutGroup
+from torchtitan.rl.types import RolloutTurnID, TrainingSample, TrainingSampleGroup
 
 
 def _training_sample(*, group_id: int, rollout_id: int) -> TrainingSample:

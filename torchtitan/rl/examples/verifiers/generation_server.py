@@ -9,10 +9,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass
 
 from aiohttp import web
@@ -25,11 +22,11 @@ logger = logging.getLogger(__name__)
 
 _SESSION_ID_HEADER = "X-Session-ID"
 
-GROUP_KEY_SAMPLING_PARAM = "torchtitan_group_key"
-"""Sampling parameter that identifies a request's rollout group.
+GROUP_ID_SAMPLING_PARAM = "torchtitan_group_id"
+"""Sampling parameter carrying a request's rollout group id.
 
-Verifiers forwards extra sampling fields verbatim in ``sampling_params``, so
-each rollout group tags its requests with the key from ``serve_group``.
+Verifiers forwards extra sampling fields verbatim in ``sampling_params``, so the
+rollouter tags every request of a group with its id.
 """
 
 
@@ -60,10 +57,6 @@ class GenerationServer(Configurable):
     server exposes Verifiers' token-generation endpoint, forwards each request
     to that function, and retains TorchTitan policy-version and metric metadata
     that the resulting Verifiers trace does not carry.
-
-    Concurrent rollout groups share this server. Each group registers its own
-    ``GenerateFn``, and every request selects it by key, so it is generated as
-    part of its own group.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -94,7 +87,7 @@ class GenerationServer(Configurable):
         self.host = config.host
         self.requested_port = config.port
         self.max_rollout_tokens = config.max_rollout_tokens
-        self.groups: dict[str, GenerateFn] = {}
+        self.generate_fn: GenerateFn | None = None
         self.runner: web.AppRunner | None = None
         self.bound_port: int | None = None
         self.request_counts: dict[str, int] = {}
@@ -111,20 +104,8 @@ class GenerationServer(Configurable):
         """OpenAI-compatible base URL used by the local Verifiers client."""
         return f"http://{self.host}:{self.port}/v1"
 
-    @contextlib.contextmanager
-    def serve_group(self, generate_fn: GenerateFn) -> Iterator[str]:
-        """Register a rollout group's ``generate_fn`` for the duration of the block.
-
-        Yields the key that the group's requests pass as ``GROUP_KEY_SAMPLING_PARAM``.
-        Requests that arrive after the block exits are rejected.
-        """
-        key = uuid.uuid4().hex
-        self.groups[key] = generate_fn
-        try:
-            yield key
-        finally:
-            # close() may have cleared the registry already.
-            self.groups.pop(key, None)
+    def set_generate_fn(self, generate_fn: GenerateFn) -> None:
+        self.generate_fn = generate_fn
 
     async def start(self) -> None:
         if self.runner is not None:
@@ -157,7 +138,6 @@ class GenerationServer(Configurable):
         self.bound_port = None
         self.request_counts.clear()
         self.generation_metadata.clear()
-        self.groups.clear()
 
     def pop_generation_metadata(
         self, session_id: str
@@ -183,6 +163,10 @@ class GenerationServer(Configurable):
         return web.json_response({"object": "list", "data": [model]})
 
     async def _handle_generate_request(self, request: web.Request) -> web.Response:
+        if self.generate_fn is None:
+            return web.json_response(
+                {"error": "TorchTitan GenerateFn is not ready"}, status=503
+            )
         session_id = request.headers.get(_SESSION_ID_HEADER)
         if not session_id:
             return web.json_response(
@@ -198,30 +182,25 @@ class GenerationServer(Configurable):
             if not isinstance(sampling_params, dict):
                 raise ValueError("sampling_params must be an object")
             sampling_params = dict(sampling_params)
-            group_key = sampling_params.pop(GROUP_KEY_SAMPLING_PARAM, None)
-            if not isinstance(group_key, str):
+            group_id = sampling_params.pop(GROUP_ID_SAMPLING_PARAM, None)
+            if isinstance(group_id, bool) or not isinstance(group_id, int):
                 raise ValueError(
-                    f"sampling_params.{GROUP_KEY_SAMPLING_PARAM} must be a string"
+                    f"sampling_params.{GROUP_ID_SAMPLING_PARAM} must be an integer"
                 )
             sampling = _parse_sampling_config(sampling_params)
             if body.get("features") is not None:
                 raise ValueError("multimodal features are not supported")
         except (TypeError, ValueError) as error:
             return web.json_response({"error": str(error)}, status=400)
-        generate_fn = self.groups.get(group_key)
-        if generate_fn is None:
-            # The rollout group that owned this key has finished.
-            return web.json_response(
-                {"error": f"unknown rollout group key {group_key!r}"}, status=409
-            )
 
         request_index = self.request_counts.get(session_id, 0)
         self.request_counts[session_id] = request_index + 1
         request_id = f"{session_id}/request={request_index}"
         try:
-            completion = await generate_fn(
+            completion = await self.generate_fn(
                 prompt_token_ids,
                 request_id=request_id,
+                group_id=group_id,
                 routing_session_id=session_id,
                 sampling_config=sampling,
             )
@@ -307,10 +286,12 @@ def _validate_token_ids(value: object, *, field_name: str) -> list[int]:
     return list(value)
 
 
-def _parse_sampling_config(value: dict):
+def _parse_sampling_config(value: object):
     """Convert Verifiers' vLLM sampling payload to TorchTitan config."""
     from torchtitan.rl.generator import SamplingConfig
 
+    if not isinstance(value, dict):
+        raise ValueError("sampling_params must be an object")
     supported = {
         "temperature",
         "top_p",

@@ -49,6 +49,8 @@ def _bare_generator(
     generator._close_request = CloseRequest() if close_requested else None
     generator._model_state_dict_pull_request = model_state_dict_pull_request
     generator._queued_generation_requests = pending or []
+    generator.policy_version = 0
+    generator._cache_policy_versions = {}
     generator._request_dispatcher = RequestDispatcher(
         rank=0,
         dp_rank=0,
@@ -69,15 +71,24 @@ def _bare_generator(
 def _request(
     request_id: str = "r0",
     *,
+    group_id: int = 0,
     routing_session_id: str | None = None,
 ) -> GenerationRequest:
     return GenerationRequest(
         request_id=request_id,
         prompt_token_ids=[1, 2],
         sampling=SamplingConfig(),
+        group_id=group_id,
         routing_session_id=routing_session_id or request_id,
-        cache_policy_version=7,
     )
+
+
+def _admit(generator: VLLMGenerator, request: GenerationRequest) -> int:
+    """Queue ``request``, run one STEP decision, and return its cache policy version."""
+    generator._queued_generation_requests.append(request)
+    decision = asyncio.run(generator._decide_next_action())
+    assert decision.action is LoopAction.STEP
+    return request.cache_policy_version
 
 
 def test_closing_returns_close() -> None:
@@ -163,3 +174,29 @@ def test_step_sticky_session_reuses_dp_rank() -> None:
         "r1": 0,
         "r2": 1,
     }
+
+
+def test_step_pins_cache_policy_version_per_session() -> None:
+    generator = _bare_generator()
+    generator.policy_version = 3
+    assert _admit(generator, _request("t0", group_id=1, routing_session_id="s0")) == 3
+
+    generator.policy_version = 4
+    # A later turn of the session keeps the salt its first turn pinned, so it can
+    # reuse the session's KV; a new session of the same group pins the current version.
+    assert _admit(generator, _request("t1", group_id=1, routing_session_id="s0")) == 3
+    assert _admit(generator, _request("t2", group_id=1, routing_session_id="s1")) == 4
+
+
+def test_release_groups_drops_pins() -> None:
+    generator = _bare_generator()
+    generator.policy_version = 3
+    _admit(generator, _request("t0", group_id=1, routing_session_id="s0"))
+    _admit(generator, _request("t1", group_id=2, routing_session_id="s1"))
+
+    # Releasing a group this generator never served is a no-op.
+    asyncio.run(generator.release_groups([1, 9]))
+
+    assert generator._cache_policy_versions == {2: {"s1": 3}}
+    generator.policy_version = 4
+    assert _admit(generator, _request("t2", group_id=1, routing_session_id="s0")) == 4

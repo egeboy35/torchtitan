@@ -25,7 +25,7 @@ class RolloutTurnID:
     """
 
     group_id: int
-    """Group id shared by sibling rollouts; routing also uses the rollout id."""
+    """Globally-unique GRPO group id; siblings share it (the sticky-routing key, sans turn)."""
     rollout_id: int
     """Sibling index within the group (0..group_size-1)."""
     turn_id: int

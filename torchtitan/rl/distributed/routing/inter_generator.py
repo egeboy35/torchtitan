@@ -20,8 +20,8 @@ from monarch.actor import Actor, concurrent_endpoint, current_size
 from torchtitan.config import Configurable
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.distributed.routing.strategies import (
+    LeastLoadedRoutingStrategy,
     RoutingStrategy,
-    StickySessionRoutingStrategy,
 )
 from torchtitan.rl.distributed.routing.types import RoutingCandidate, RoutingContext
 
@@ -51,41 +51,8 @@ class _GeneratorHandle(RoutingCandidate):
     state: _GeneratorState = _GeneratorState.SERVING
     """Current routing lifecycle state for this generator."""
 
-    policy_version: int | None = None
-    """Version installed by the last completed pull on this generator."""
-
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     """Set when this generator has no reserved routed calls."""
-
-
-@dataclass(kw_only=True, slots=True)
-class _RoutingSession:
-    """Router state for one rollout: its cache namespace and how far it has advanced."""
-
-    generator: _GeneratorHandle
-    """Generator that ran the rollout's last call and holds its history KV."""
-
-    cache_policy_version: int
-    """The rollout's cache namespace, reused while it stays on ``generator``."""
-
-    max_policy_version: int
-    """Newest policy version the rollout has sampled; later calls never go to an
-    older generator."""
-
-
-@dataclass(kw_only=True, slots=True)
-class _GroupCacheNamespace:
-    """A rollout group's cache namespace, pinned when its first call is routed."""
-
-    generator: _GeneratorHandle
-    """Generator that ran the group's first call and holds the group prompt's KV."""
-
-    cache_policy_version: int
-    """The group's cache namespace, used by new siblings on ``generator``. New
-    siblings never go to a generator older than it."""
-
-    sessions: dict[str, _RoutingSession] = field(default_factory=dict)
-    """The group's rollouts that have completed a call, keyed by session id."""
 
 
 class InterGeneratorRouter(Actor, Configurable):
@@ -119,12 +86,11 @@ class InterGeneratorRouter(Actor, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         strategy: RoutingStrategy.Config = field(
-            default_factory=StickySessionRoutingStrategy.Config
+            default_factory=LeastLoadedRoutingStrategy.Config
         )
         """Routing strategy, selected by its config type, e.g.
-        ``StickySessionRoutingStrategy.Config()`` or
-        ``LeastLoadedRoutingStrategy.Config()``. The default keeps each rollout's
-        turns on one generator, so a turn can reuse its earlier turns' KV cache."""
+        ``RoundRobinRoutingStrategy.Config()`` or
+        ``LeastLoadedRoutingStrategy.Config()``."""
 
         hot_swap: bool = True
         """When True, pulls model's state dict concurrently with in-flight
@@ -161,8 +127,6 @@ class InterGeneratorRouter(Actor, Configurable):
             h.idle.set()
 
         self._strategy = config.strategy.build()
-        self._group_namespaces: dict[int, _GroupCacheNamespace] = {}
-        self._routing_state_changed = asyncio.Event()
         self._serving = asyncio.Event()
         self._refresh_serving_status()
 
@@ -184,7 +148,6 @@ class InterGeneratorRouter(Actor, Configurable):
 
         h.state = state
         self._refresh_serving_status()
-        self._routing_state_changed.set()
 
     def _reserve(self, h: _GeneratorHandle, cost: int) -> None:
         """Reserve estimated generation work on a handle before dispatch."""
@@ -210,128 +173,15 @@ class InterGeneratorRouter(Actor, Configurable):
         method: str,
         *args,
         routing_ctx: RoutingContext,
-        group_id: int,
         **kwargs,
     ) -> Any:
-        """Route one rollout turn and pass the ``cache_policy_version`` to salt its KV with.
-
-        1. Wait for a generator whose version does not roll back the rollout or
-           its group; the strategy places the call among those.
-        2. Pin the group's cache namespace on its first routed call.
-        3. Reuse the salt of the KV the call can hit on that generator, if any.
-        4. After the call, remember where the rollout ran and at which versions.
+        """Dispatch one call to a strategy-chosen serving generator's rank 0;
+        return its result.
         """
-        session_id = routing_ctx.session_id
-        while True:
-            await self._serving.wait()
-            # Re-read after every wait: while this call waited, a sibling may
-            # have pinned the group's namespace.
-            group = self._group_namespaces.get(group_id)
-            session = (
-                group.sessions.get(session_id)
-                if group is not None and session_id is not None
-                else None
-            )
-            h = self._choose_not_older_than(
-                routing_ctx, self._min_policy_version(session, group)
-            )
-            if h is not None:
-                break
-            self._routing_state_changed.clear()
-            await self._routing_state_changed.wait()
-
-        if group is None:
-            # Siblings enter concurrently, so pin the namespace now rather than
-            # after the first generation completes.
-            assert (
-                h.policy_version is not None
-            ), "generation requires an initial weight pull"
-            group = _GroupCacheNamespace(
-                generator=h, cache_policy_version=h.policy_version
-            )
-            self._group_namespaces[group_id] = group
-        cache_policy_version = self._reusable_cache_policy_version(h, session, group)
-
-        result = await self._dispatch(
-            h,
-            method,
-            *args,
-            routing_ctx=routing_ctx,
-            cache_policy_version=cache_policy_version,
-            **kwargs,
-        )
-
-        # If the group finished during the call, this updates a detached record.
-        if session_id is not None:
-            group.sessions[session_id] = _RoutingSession(
-                generator=h,
-                # None means the generator salted with its own installed
-                # version, which is the completion's min version.
-                cache_policy_version=(
-                    cache_policy_version
-                    if cache_policy_version is not None
-                    else result.min_policy_version
-                ),
-                max_policy_version=(
-                    max(session.max_policy_version, result.max_policy_version)
-                    if session is not None
-                    else result.max_policy_version
-                ),
-            )
-        return result
-
-    @staticmethod
-    def _min_policy_version(
-        session: _RoutingSession | None, group: _GroupCacheNamespace | None
-    ) -> int | None:
-        """Oldest generator version that does not roll back the call.
-
-        A later turn must not run older than anything its rollout already
-        sampled; a new sibling must not run older than its group's namespace.
-        """
-        if session is not None:
-            return session.max_policy_version
-        if group is not None:
-            return group.cache_policy_version
-        return None
-
-    def _choose_not_older_than(
-        self, routing_ctx: RoutingContext, min_policy_version: int | None
-    ) -> _GeneratorHandle | None:
-        """Let the strategy choose among serving generators at or above
-        ``min_policy_version``; return None if there are none."""
-        eligible = [
-            h
-            for h in self._candidates()
-            if min_policy_version is None
-            or (h.policy_version is not None and h.policy_version >= min_policy_version)
-        ]
-        return self._strategy.choose(routing_ctx, eligible) if eligible else None
-
-    @staticmethod
-    def _reusable_cache_policy_version(
-        h: _GeneratorHandle,
-        session: _RoutingSession | None,
-        group: _GroupCacheNamespace,
-    ) -> int | None:
-        """Salt of the KV the call can hit on ``h``: the rollout's on the
-        generator it last ran on, or, for a new rollout, the group's on the
-        group's generator. Elsewhere there is no such KV, and None makes the
-        generator salt with its own installed version.
-        """
-        if session is not None:
-            return session.cache_policy_version if h is session.generator else None
-        return group.cache_policy_version if h is group.generator else None
-
-    async def _dispatch(
-        self,
-        h: _GeneratorHandle,
-        method: str,
-        *args,
-        routing_ctx: RoutingContext,
-        **kwargs,
-    ) -> Any:
-        """Call ``method`` on ``h``'s rank 0 while holding its load reservation."""
+        await self._serving.wait()
+        candidates = self._candidates()
+        assert candidates, "serving event was set with no serving generators"
+        h = self._strategy.choose(routing_ctx, candidates)
         self._reserve(h, routing_ctx.estimated_cost)
         try:
             return await getattr(h.rank0_actor, method).call_one(*args, **kwargs)
@@ -388,8 +238,6 @@ class InterGeneratorRouter(Actor, Configurable):
                     await h.rank0_actor.pull_model_state_dict.call_one(policy_version)
                 finally:
                     self._set_state(h, _GeneratorState.SERVING)
-            h.policy_version = policy_version
-            self._routing_state_changed.set()
 
         # Start the pulls in parallel. Technically we could do rolling sync to
         # maintain availability during weight sync, but that's not a priority
@@ -405,8 +253,8 @@ class InterGeneratorRouter(Actor, Configurable):
         prompt_token_ids: list[int],
         *,
         request_id: str,
+        group_id: int,
         routing_session_id: str | None,
-        routing_group_id: int,
         sampling_config: Any | None,
         metrics_prefix: str,
     ) -> Any:
@@ -414,8 +262,8 @@ class InterGeneratorRouter(Actor, Configurable):
         return await self._route(
             "generate",
             prompt_token_ids,
-            group_id=routing_group_id,
             request_id=request_id,
+            group_id=group_id,
             # VLLMGenerator.generate also requires this field for its
             # intra-mesh DP routing.
             routing_session_id=routing_session_id,
@@ -428,14 +276,6 @@ class InterGeneratorRouter(Actor, Configurable):
             ),
         )
 
-    def _finish_group(self, group_id: int) -> None:
-        self._group_namespaces.pop(group_id, None)
-
-    @concurrent_endpoint
-    async def finish_group(self, group_id: int) -> None:
-        """Release a completed rollout group's routing state."""
-        self._finish_group(group_id)
-
     @concurrent_endpoint
     async def start_engine_loop(self) -> None:
         """Start the engine loop on every rank of every generator."""
@@ -446,6 +286,11 @@ class InterGeneratorRouter(Actor, Configurable):
         """Set the step counter in this process and in every generator rank."""
         sl.set_step(step)
         await self._fanout("sync_log_step", step)
+
+    @concurrent_endpoint
+    async def release_groups(self, group_ids: list[int]) -> None:
+        """Tell every generator that these rollout groups are finished."""
+        await self._fanout("release_groups", group_ids)
 
     @concurrent_endpoint
     async def pull_model_state_dict(self, policy_version: int) -> None:

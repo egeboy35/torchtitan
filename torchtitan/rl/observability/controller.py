@@ -262,18 +262,6 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
     truncated = [float(rollout.status.is_truncated()) for rollout in rollouts]
     rewards = [rollout.reward for rollout in rollouts if rollout.reward is not None]
     num_turns = [float(len(rollout.turns)) for rollout in rollouts]
-    start_versions_by_group: dict[int, list[int]] = defaultdict(list)
-    for rollout in rollouts:
-        if rollout.turns and rollout.turns[0].min_policy_version is not None:
-            start_versions_by_group[rollout.group_id].append(
-                rollout.turns[0].min_policy_version
-            )
-    # Only groups with siblings have a spread; validation groups have one rollout.
-    start_version_spreads = [
-        max(versions) - min(versions)
-        for versions in start_versions_by_group.values()
-        if len(versions) > 1
-    ]
 
     out: list[m.Metric] = [
         m.Metric(f"{prefix}/output_tokens", m.Mean.from_list(completion_lens)),
@@ -290,13 +278,6 @@ def compute_rollout_metrics(prefix: str, rollouts: list[Rollout]) -> list[m.Metr
         m.Metric(f"{prefix}/truncation_rate", m.Mean.from_list(truncated)),
         m.Metric(f"{prefix}_reward", m.SummaryStats.from_list(rewards)),
     ]
-    if start_version_spreads:
-        out.append(
-            m.Metric(
-                f"{prefix}/group_start_policy_version_spread",
-                m.Mean.from_list(start_version_spreads),
-            )
-        )
 
     # Per-component reward breakdown
     values_by_name: dict[str, list[float]] = defaultdict(list)

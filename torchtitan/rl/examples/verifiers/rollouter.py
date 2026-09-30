@@ -29,7 +29,7 @@ from torchtitan.rl.examples.verifiers.data import (
 from torchtitan.rl.examples.verifiers.env_server import VerifiersEnvServer
 from torchtitan.rl.examples.verifiers.generation_server import (
     GenerationServer,
-    GROUP_KEY_SAMPLING_PARAM,
+    GROUP_ID_SAMPLING_PARAM,
     VerifiersGenerationMetadata,
 )
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
@@ -236,23 +236,22 @@ class VerifiersRollouter(Rollouter):
         """Run sibling rollouts through Verifiers, then compute advantages."""
         if self._generation_server is None:
             raise RuntimeError("Verifiers rollouter is not initialized")
-        with self._generation_server.serve_group(generate_fn) as group_key:
-            rollouts = await asyncio.gather(
-                *(
-                    self._run_single_rollout(
-                        sample=sample,
-                        sampling=(
-                            sampling
-                            if sampling.seed is None
-                            else replace(sampling, seed=sampling.seed + rollout_id)
-                        ),
-                        group_key=group_key,
-                        group_id=group_id,
-                        rollout_id=rollout_id,
-                    )
-                    for rollout_id in range(group_size)
+        self._generation_server.set_generate_fn(generate_fn)
+        rollouts = await asyncio.gather(
+            *(
+                self._run_single_rollout(
+                    sample=sample,
+                    sampling=(
+                        sampling
+                        if sampling.seed is None
+                        else replace(sampling, seed=sampling.seed + rollout_id)
+                    ),
+                    group_id=group_id,
+                    rollout_id=rollout_id,
                 )
+                for rollout_id in range(group_size)
             )
+        )
 
         outputs = await self._rubric.score_group(rollouts, sample)
         for rollout, output in zip(rollouts, outputs, strict=True):
@@ -270,7 +269,6 @@ class VerifiersRollouter(Rollouter):
         *,
         sample: object,
         sampling: SamplingConfig,
-        group_key: str,
         group_id: int,
         rollout_id: int,
     ) -> Rollout:
@@ -296,7 +294,7 @@ class VerifiersRollouter(Rollouter):
                 top_p=sampling.top_p,
                 max_tokens=sampling.max_tokens,
                 seed=sampling.seed,
-                **{GROUP_KEY_SAMPLING_PARAM: group_key},
+                **{GROUP_ID_SAMPLING_PARAM: group_id},
             ),
         )
         traces = [trace for trace in verifiers_episode.traces if trace.agent.trainable]

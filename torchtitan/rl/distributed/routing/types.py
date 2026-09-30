@@ -38,5 +38,6 @@ class RoutingContext:
     """Estimated request cost used by load-aware routing strategies."""
 
     session_id: str | None = None
-    """Stable rollout-session key used for routing affinity. ``None`` means
-    the request has no session affinity."""
+    """Stable session key consumed only by sticky routing strategies; other
+    strategies ignore it. ``None`` means the request is unpinned and uses fallback
+    routing without session affinity."""
