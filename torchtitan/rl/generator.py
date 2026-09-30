@@ -981,9 +981,13 @@ class VLLMGenerator(Configurable):
 
         self.policy_version = 0
         # RANK 0: group id -> routing session id -> policy version the session's cache
-        # salt is pinned to, set at the session's first admission. Only the controller
-        # knows when a rollout has no more turns, so entries live until it calls
-        # `release_groups`.
+        # salt is pinned to, set at the session's first admission. Pins are per session,
+        # not per group, so a rollout first admitted after a pull pins the new version
+        # instead of inheriting its group's older one (a per-group pin would reuse the
+        # group's prompt KV but make the rollout more off-policy). The group id level
+        # only exists so the controller, which knows group ids but not session ids, can
+        # drop a finished group's pins. Only the controller knows when a rollout has no
+        # more turns, so entries live until it calls `release_groups`.
         self._cache_policy_versions: dict[int, dict[str, int]] = {}
 
         # --- Continuous-batching state (see the class docstring) ---
@@ -1362,6 +1366,9 @@ class VLLMGenerator(Configurable):
         self.policy_version = version
         if self.config.reset_kv_cache_on_weight_sync:
             self._cache_policy_versions.clear()
+            # Always reset running requests too: the only reason to reset is a strict
+            # recompute under the new weights. Keeping running requests' KV while hiding
+            # old KV from new requests is already what the default (no reset) does via the salt.
             self._engine.reset_prefix_cache(
                 reset_running_requests=True,
             )
