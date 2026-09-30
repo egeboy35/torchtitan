@@ -456,8 +456,8 @@ class RequestDispatcher:
         self,
         requests_per_dp_rank: list[list[GenerationRequest]],
     ) -> None:
-        """RANK 0: stamp each request's cache policy version as the min version on every
-        future in this STEP decision, across all DP ranks. The request may reuse KV cached
+        """RANK 0: stamp each request's min policy version on every future in this STEP
+        decision, across all DP ranks. Without a KV reset the request may reuse KV cached
         under that version, so it is the oldest policy the completion can depend on. Rank 0
         owns the futures regardless of which DP rank serves the request, so it stamps them
         all here."""
@@ -465,7 +465,7 @@ class RequestDispatcher:
             for request in dp_requests:
                 self._rank0_generation_futures[
                     request.request_id
-                ].min_policy_version = request.cache_policy_version
+                ].min_policy_version = request.min_policy_version
 
     def setup(self) -> None:
         """One-time setup before the engine loop starts (DP>1): distribute rank 0's
@@ -980,15 +980,16 @@ class VLLMGenerator(Configurable):
             )
 
         self.policy_version = 0
-        # RANK 0: group id -> routing session id -> policy version the session's cache
-        # salt is pinned to, set at the session's first admission. Pins are per session,
+        # RANK 0: group id -> routing session id -> min policy version the session is
+        # pinned to, set at the session's first admission and used as its prefix cache
+        # salt. Unused with reset_kv_cache_on_weight_sync. Pins are per session,
         # not per group, so a rollout first admitted after a pull pins the new version
         # instead of inheriting its group's older one (a per-group pin would reuse the
         # group's prompt KV but make the rollout more off-policy). The group id level
         # only exists so the controller, which knows group ids but not session ids, can
         # drop a finished group's pins. Only the controller knows when a rollout has no
         # more turns, so entries live until it calls `release_groups`.
-        self._cache_policy_versions: dict[int, dict[str, int]] = {}
+        self._min_policy_versions: dict[int, dict[str, int]] = {}
 
         # --- Continuous-batching state (see the class docstring) ---
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
@@ -1198,15 +1199,18 @@ class VLLMGenerator(Configurable):
                     if local_requests:
                         # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
                         # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
-                        engine_inputs = self._engine.renderer.render_cmpl(
-                            [
-                                {
-                                    "prompt_token_ids": request.prompt_token_ids,
-                                    "cache_salt": str(request.cache_policy_version),
-                                }
-                                for request in local_requests
-                            ]
-                        )
+                        prompts = [
+                            {"prompt_token_ids": request.prompt_token_ids}
+                            for request in local_requests
+                        ]
+                        if not self.config.reset_kv_cache_on_weight_sync:
+                            # Salt by the pinned version so a request only reuses KV
+                            # computed under that version.
+                            for prompt, request in zip(
+                                prompts, local_requests, strict=True
+                            ):
+                                prompt["cache_salt"] = str(request.min_policy_version)
+                        engine_inputs = self._engine.renderer.render_cmpl(prompts)
                         for request, engine_input in zip(
                             local_requests, engine_inputs, strict=True
                         ):
@@ -1267,9 +1271,13 @@ class VLLMGenerator(Configurable):
                 [],
             )
             for request in queued:
-                request.cache_policy_version = self._cache_policy_versions.setdefault(
-                    request.group_id, {}
-                ).setdefault(request.routing_session_id, self.policy_version)
+                if self.config.reset_kv_cache_on_weight_sync:
+                    # Each pull resets all KV, so requests need no pin or salt.
+                    request.min_policy_version = self.policy_version
+                else:
+                    request.min_policy_version = self._min_policy_versions.setdefault(
+                        request.group_id, {}
+                    ).setdefault(request.routing_session_id, self.policy_version)
             return LoopDecision(
                 action=LoopAction.STEP,
                 requests_per_dp_rank=self._request_dispatcher.rank0_route(queued),
@@ -1308,7 +1316,6 @@ class VLLMGenerator(Configurable):
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
 
-    @sl.log_trace_span("pull_model_state_dict")
     async def release_groups(self, group_ids: list[int]) -> None:
         """Drop the pinned cache salts of finished rollout groups.
 
@@ -1316,8 +1323,9 @@ class VLLMGenerator(Configurable):
             group_ids: Groups with no more generation calls.
         """
         for group_id in group_ids:
-            self._cache_policy_versions.pop(group_id, None)
+            self._min_policy_versions.pop(group_id, None)
 
+    @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:
         """Queues a weight pull for `version` and blocks until the engine loop has finished pulling.
 
@@ -1365,7 +1373,6 @@ class VLLMGenerator(Configurable):
         model.model.load_state_dict(model_sd, strict=False)
         self.policy_version = version
         if self.config.reset_kv_cache_on_weight_sync:
-            self._cache_policy_versions.clear()
             # Always reset running requests too: the only reason to reset is a strict
             # recompute under the new weights. Keeping running requests' KV while hiding
             # old KV from new requests is already what the default (no reset) does via the salt.
@@ -1463,8 +1470,10 @@ class GenerationRequest:
     sampling: SamplingConfig
     group_id: int
     routing_session_id: str
-    cache_policy_version: int = field(init=False)
-    """Policy version salting this request's prefix cache; rank 0 sets it at admission."""
+    min_policy_version: int = field(init=False)
+    """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
+    Without a KV reset on weight sync it is the session's pinned version and salts the
+    prefix cache."""
 
 
 @dataclass(kw_only=True, slots=True)

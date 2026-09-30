@@ -268,7 +268,7 @@ def _admit_through_engine_loop(monkeypatch, generator, requests):
     asyncio.run(generator._engine_loop())
 
 
-def _generation_request(request_id: str, *, cache_policy_version: int):
+def _generation_request(request_id: str, *, min_policy_version: int):
     request = GenerationRequest(
         request_id=request_id,
         prompt_token_ids=[1, 2],
@@ -276,15 +276,15 @@ def _generation_request(request_id: str, *, cache_policy_version: int):
         group_id=3,
         routing_session_id="group=3/rollout=0",
     )
-    request.cache_policy_version = cache_policy_version
+    request.min_policy_version = min_policy_version
     return request
 
 
-def test_admission_salts_prompt_with_cache_policy_version(monkeypatch):
+def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
     # The pinned version (6), not the installed one (7), salts the prefix cache.
     generator = _generator()
     engine = cast(_FakeEngine, generator._engine)
-    request = _generation_request("r0", cache_policy_version=6)
+    request = _generation_request("r0", min_policy_version=6)
 
     _admit_through_engine_loop(monkeypatch, generator, [request])
 
@@ -292,7 +292,20 @@ def test_admission_salts_prompt_with_cache_policy_version(monkeypatch):
     assert kwargs["prompt"]["cache_salt"] == "6"
 
 
-def test_min_policy_version_is_cache_policy_version():
+def test_admission_with_kv_reset_does_not_salt_prompt(monkeypatch):
+    generator = _generator()
+    generator.config.reset_kv_cache_on_weight_sync = True
+    engine = cast(_FakeEngine, generator._engine)
+
+    _admit_through_engine_loop(
+        monkeypatch, generator, [_generation_request("r0", min_policy_version=6)]
+    )
+
+    _, kwargs = engine.add_requests[0]
+    assert kwargs["prompt"]["cache_salt"] is None
+
+
+def test_stamp_sets_future_min_policy_version():
     # A request may reuse KV cached under its pinned version, so that version bounds
     # the completion's staleness.
     dispatcher = _dispatcher()
@@ -304,8 +317,8 @@ def test_min_policy_version_is_cache_policy_version():
     dispatcher.rank0_stamp_min_policy_version(
         [
             [
-                _generation_request("r0", cache_policy_version=4),
-                _generation_request("r1", cache_policy_version=6),
+                _generation_request("r0", min_policy_version=4),
+                _generation_request("r1", min_policy_version=6),
             ]
         ]
     )
@@ -322,7 +335,6 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
         generator = _generator()
         engine = cast(_FakeEngine, generator._engine)
         generator.config.reset_kv_cache_on_weight_sync = reset_kv_cache
-        generator._cache_policy_versions = {3: {"group=3/rollout=0": 7}}
         generator._pull_model_state_dict_future = None
         generator._model_state_dict_pull_request = None
         model = SimpleNamespace(
@@ -343,9 +355,6 @@ def test_weight_sync_reset_kv_cache_flag_controls_cache_reset(
         assert generator.policy_version == 8
         expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
         assert engine.reset_prefix_cache_calls == expected
-        # Pins survive a pull unless the cache they point at was reset.
-        expected_pins = {} if reset_kv_cache else {3: {"group=3/rollout=0": 7}}
-        assert generator._cache_policy_versions == expected_pins
 
     asyncio.run(run())
 
