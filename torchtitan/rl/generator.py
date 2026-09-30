@@ -757,9 +757,10 @@ class VLLMGenerator(Configurable):
         reset_kv_cache_on_weight_sync: bool = False
         """Reset cached and running-request KV after each weight sync.
 
-        The default preserves in-flight requests and their KV: a rollout keeps the
-        cache salt pinned when this generator first admitted it, so its later turns
-        reuse its KV across weight syncs, while new rollouts use the current version.
+        The default preserves in-flight requests and their KV: a rollout group keeps the
+        cache salt pinned when this generator first admitted it, so its rollouts and
+        later turns reuse its KV across weight syncs, while new groups use the current
+        version.
         Enable this to clear prefix-cache entries and preempt running requests; vLLM
         then recomputes their KV under the new weights when they resume."""
 
@@ -980,16 +981,14 @@ class VLLMGenerator(Configurable):
             )
 
         self.policy_version = 0
-        # RANK 0: group id -> routing session id -> min policy version the session is
-        # pinned to, set at the session's first admission and used as its prefix cache
-        # salt. Unused with reset_kv_cache_on_weight_sync. Pins are per session,
-        # not per group, so a rollout first admitted after a pull pins the new version
-        # instead of inheriting its group's older one (a per-group pin would reuse the
-        # group's prompt KV but make the rollout more off-policy). The group id level
-        # only exists so the controller, which knows group ids but not session ids, can
-        # drop a finished group's pins. Only the controller knows when a rollout has no
-        # more turns, so entries live until it calls `release_groups`.
-        self._min_policy_versions: dict[int, dict[str, int]] = {}
+        # RANK 0: group id -> min policy version the group is pinned to, set at the
+        # group's first admission and used as its prefix cache salt. Unused with
+        # reset_kv_cache_on_weight_sync. All rollouts of a group share the pin, so a
+        # rollout first admitted after a pull still reuses its group's prompt KV, at the
+        # cost of depending on the group's older version. Only the controller knows when
+        # a group makes no more generation calls, so entries live until it calls
+        # `release_groups`.
+        self._group_min_policy_versions: dict[int, int] = {}
 
         # --- Continuous-batching state (see the class docstring) ---
         self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
@@ -1085,9 +1084,9 @@ class VLLMGenerator(Configurable):
         Args:
             prompt_token_ids: One tokenized prompt `[token_ids]`.
             request_id: Unique id for this request, echoed on the `Completion`.
-            group_id: Rollout group id; `release_groups` drops the group's cache salts.
-            routing_session_id: Stable session key for in-mesh DP routing. Requests of
-                one session share a prefix cache salt.
+            group_id: Rollout group id. Requests of one group share a prefix cache
+                salt; `release_groups` drops it.
+            routing_session_id: Stable session key for in-mesh DP routing.
             sampling_config: Optional per-call override for the generator's
                 default SamplingConfig.
             metrics_prefix: Namespace prepended to every metric key on the returned
@@ -1275,9 +1274,11 @@ class VLLMGenerator(Configurable):
                     # Each pull resets all KV, so requests need no pin or salt.
                     request.min_policy_version = self.policy_version
                 else:
-                    request.min_policy_version = self._min_policy_versions.setdefault(
-                        request.group_id, {}
-                    ).setdefault(request.routing_session_id, self.policy_version)
+                    request.min_policy_version = (
+                        self._group_min_policy_versions.setdefault(
+                            request.group_id, self.policy_version
+                        )
+                    )
             return LoopDecision(
                 action=LoopAction.STEP,
                 requests_per_dp_rank=self._request_dispatcher.rank0_route(queued),
@@ -1323,7 +1324,7 @@ class VLLMGenerator(Configurable):
             group_ids: Groups with no more generation calls.
         """
         for group_id in group_ids:
-            self._min_policy_versions.pop(group_id, None)
+            self._group_min_policy_versions.pop(group_id, None)
 
     @sl.log_trace_span("pull_model_state_dict")
     async def pull_model_state_dict(self, version: int) -> None:
@@ -1472,7 +1473,7 @@ class GenerationRequest:
     routing_session_id: str
     min_policy_version: int = field(init=False)
     """Oldest policy version this request's KV can come from; rank 0 sets it at admission.
-    Without a KV reset on weight sync it is the session's pinned version and salts the
+    Without a KV reset on weight sync it is the group's pinned version and salts the
     prefix cache."""
 
 

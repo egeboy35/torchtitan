@@ -55,7 +55,7 @@ def _bare_generator(
     generator._model_state_dict_pull_request = model_state_dict_pull_request
     generator._queued_generation_requests = pending or []
     generator.policy_version = 0
-    generator._min_policy_versions = {}
+    generator._group_min_policy_versions = {}
     generator._request_dispatcher = RequestDispatcher(
         rank=0,
         dp_rank=0,
@@ -181,16 +181,17 @@ def test_step_sticky_session_reuses_dp_rank() -> None:
     }
 
 
-def test_step_pins_min_policy_version_per_session() -> None:
+def test_step_pins_min_policy_version_per_group() -> None:
     generator = _bare_generator()
     generator.policy_version = 3
     assert _admit(generator, _request("t0", group_id=1, routing_session_id="s0")) == 3
 
     generator.policy_version = 4
-    # A later turn of the session keeps the salt its first turn pinned, so it can
-    # reuse the session's KV; a new session of the same group pins the current version.
+    # Later turns and new rollouts of the group keep the salt its first admission
+    # pinned, so they can reuse the group's KV; a new group pins the current version.
     assert _admit(generator, _request("t1", group_id=1, routing_session_id="s0")) == 3
-    assert _admit(generator, _request("t2", group_id=1, routing_session_id="s1")) == 4
+    assert _admit(generator, _request("t2", group_id=1, routing_session_id="s1")) == 3
+    assert _admit(generator, _request("t3", group_id=2, routing_session_id="s2")) == 4
 
 
 def test_step_with_kv_reset_uses_current_version_without_pins() -> None:
@@ -200,7 +201,7 @@ def test_step_with_kv_reset_uses_current_version_without_pins() -> None:
 
     generator.policy_version = 4
     assert _admit(generator, _request("t1", group_id=1, routing_session_id="s0")) == 4
-    assert generator._min_policy_versions == {}
+    assert generator._group_min_policy_versions == {}
 
 
 def test_release_groups_drops_pins() -> None:
@@ -212,6 +213,6 @@ def test_release_groups_drops_pins() -> None:
     # Releasing a group this generator never served is a no-op.
     asyncio.run(generator.release_groups([1, 9]))
 
-    assert generator._min_policy_versions == {2: {"s1": 3}}
+    assert generator._group_min_policy_versions == {2: 3}
     generator.policy_version = 4
     assert _admit(generator, _request("t2", group_id=1, routing_session_id="s0")) == 4
