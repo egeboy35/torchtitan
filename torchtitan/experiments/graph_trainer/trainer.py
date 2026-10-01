@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torch.distributed.pipelining.schedules import _PipelineScheduleRuntime
 
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.distributed.cuda_graph import cuda_graph_teardown
@@ -17,6 +18,7 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
     make_spmd_graph_runtime,
 )
+from torchtitan.experiments.graph_trainer.graph_pp.runner import GraphRuntime
 from torchtitan.experiments.graph_trainer.memory_policy import (
     validate_memory_policy_config,
 )
@@ -81,6 +83,22 @@ class GraphTrainingEngine(TrainingEngine):
             output_dir=output_dir,
         )
         self._pinned_pool_ctx = None
+
+    def _pipeline_liveness_schedule(self) -> _PipelineScheduleRuntime | None:
+        """Return GraphPP's original schedule for activation-slot planning."""
+        if not self.parallelism_context.pp_enabled:
+            return None
+        graph_runtime = self.pp_schedule
+        assert isinstance(graph_runtime, GraphRuntime)
+        return graph_runtime.pipeline_liveness_schedule
+
+    def _register_pipeline_forward_context(self, forward_context: Any) -> None:
+        """Install a forward context on the GraphPP runtime before tracing."""
+        if not self.parallelism_context.pp_enabled:
+            return
+        graph_runtime = self.pp_schedule
+        assert isinstance(graph_runtime, GraphRuntime)
+        graph_runtime.set_dist_moe_forward_context(forward_context)
 
     def _initialize_forward_backward(self) -> None:
         if not self.parallelism_context.pp_enabled:

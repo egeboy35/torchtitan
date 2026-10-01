@@ -13,6 +13,7 @@ from .batch_invariance import BatchInvariantFlexConverter
 from .cast_linear import LMHeadCastConverter
 from .context_parallel import ContextParallelTransform
 from .converter import ModelConfigConverter, validate_converter_compatibility
+from .dist_moe import DistMoeTransform
 from .lora import GroupedLinearLoRAHandler, LinearLoRAHandler, LoRATransform
 from .quantization import (
     Float8GroupedLinearConverter,
@@ -32,6 +33,7 @@ __all__ = [
     "convert_config_type",
     "ContextParallelTransform",
     "BatchInvariantFlexConverter",
+    "DistMoeTransform",
     "LMHeadCastConverter",
     "GroupedLinearLoRAHandler",
     "LinearLoRAHandler",
