@@ -11,6 +11,7 @@ import pytest
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.models.common.attention import VarlenInnerAttention
+from torchtitan.models.common.dist_moe import DistMoeRoutedExperts, DistMoeRuntime
 from torchtitan.models.llama3.config_registry import llama3_debugmodel
 from torchtitan_recipes.tests.features import llama3_debugmodel_hf_checkpoint_load
 from torchtitan_recipes.tests.models import llama3_debugmodel_fsdp2_tp2_pp2
@@ -149,7 +150,16 @@ def test_h100_tests_are_registered_in_separate_suite() -> None:
 
 
 def test_b200_tests_are_registered_in_separate_suite() -> None:
-    assert {test.test_name for test in build_b200_tests_list()} == {
+    b200_tests = build_b200_tests_list()
+    assert {test.test_name for test in b200_tests} == {
+        "dist_moe_bf16_fsdp_ep_cudagraph",
+        "dist_moe_mxfp8_fsdp_ep_cudagraph",
+        "dist_moe_mxfp8_fsdp_ep_pp_cudagraph",
+        "dist_moe_mxfp8_fsdp_ep_pp_fp32_reduce_cudagraph",
+        "dist_moe_mxfp8_fsdp_ep_cudagraph_vmm",
+        "graph_trainer_dist_moe_bf16_fsdp_ep",
+        "graph_trainer_dist_moe_mxfp8_fsdp_ep",
+        "graph_trainer_dist_moe_mxfp8_fsdp_ep_pp_cudagraph",
         "kimi_k3_fsdp2_tp2_ep2_pp2_vpp4",
         "kimi_k3_mm",
         "kimi_k3_mm_muon",
@@ -157,6 +167,42 @@ def test_b200_tests_are_registered_in_separate_suite() -> None:
         "nvfp4_linear_fsdp",
     }
     assert "kimi_k3_mm" not in {test.test_name for test in build_model_tests_list()}
+
+    vmm_test = next(
+        test
+        for test in b200_tests
+        if test.test_name == "dist_moe_mxfp8_fsdp_ep_cudagraph_vmm"
+    )
+    config = vmm_test.configs[0]()
+    runtime = config.dist_moe
+    assert isinstance(runtime, DistMoeRuntime.Config)
+    assert runtime.scratch_capacity_factor == 1.0
+    assert runtime.vmm_capacity_factor == 4.0
+
+    for test_name in (
+        "dist_moe_bf16_fsdp_ep_cudagraph",
+        "dist_moe_mxfp8_fsdp_ep_cudagraph",
+    ):
+        test = next(test for test in b200_tests if test.test_name == test_name)
+        config = test.configs[0]()
+        expert_configs = list(config.model.traverse(DistMoeRoutedExperts.Config))
+        assert expert_configs
+        assert all(expert.inplace_wgrad_accum for _, expert, _, _ in expert_configs)
+
+    fp32_pp_test = next(
+        test
+        for test in b200_tests
+        if test.test_name == "dist_moe_mxfp8_fsdp_ep_pp_fp32_reduce_cudagraph"
+    )
+    fp32_pp_config = fp32_pp_test.configs[0]()
+    assert fp32_pp_config.parallelism.pipeline_parallel_degree == 2
+    assert fp32_pp_config.training.mixed_precision_reduce == "float32"
+    assert all(
+        experts.inplace_wgrad_accum
+        for _, experts, _, _ in fp32_pp_config.model.traverse(
+            DistMoeRoutedExperts.Config
+        )
+    )
 
 
 def test_specialized_moe_backends_have_ep_coverage() -> None:

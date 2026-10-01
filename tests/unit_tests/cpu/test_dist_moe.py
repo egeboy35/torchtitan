@@ -12,6 +12,8 @@ from unittest.mock import Mock, patch
 import dist_moe
 import pytest
 import torch
+
+import torchtitan.config.transform.quantization as quantization_transform
 from torch.distributed.pipelining import PipelineStageInfo
 from torchtitan.config.configs import TrainingConfig
 from torchtitan.config.transform import (
@@ -19,8 +21,12 @@ from torchtitan.config.transform import (
     DistMoeTransform,
     LoRATransform,
 )
+from torchtitan.experiments.graph_trainer.deepseek_v3 import (
+    config_registry as graph_configs,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.runner import GraphRuntime
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainingEngine
+from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.common.config_utils import make_routed_experts_config
 from torchtitan.models.common.dist_moe import (
     DistMoeRoutedExperts,
@@ -30,6 +36,7 @@ from torchtitan.models.common.dist_moe import (
 from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 from torchtitan.models.common.moe import RoutedExperts
 from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.models.deepseek_v3 import config_registry as eager_configs
 from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_debugmodel
 from torchtitan.protocols.module import Module
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
@@ -332,7 +339,7 @@ def test_forward_passes_native_postprocess_and_wgrad_policy() -> None:
     """Forward passes module-owned postprocessing and annex-owned WGRAD policy."""
     stock = _stock_config()
     stock.output_postprocess = _NativePostprocess.Config(dim=32)
-    transformed = DistMoeTransform(inplace_wgrad_accum=True).transform(stock)
+    transformed = DistMoeTransform().transform(stock)
     module = cast(DistMoeRoutedExperts, transformed.build())
     module._runtime = _runtime()
     module._runtime.context = cast(Any, object())
@@ -419,3 +426,126 @@ def test_runtime_config_requires_bfloat16_unsharded_parameters() -> None:
             dist_moe=DistMoeRuntime.Config(),
             training=TrainingConfig(mixed_precision_param="float32"),
         )
+
+
+@pytest.mark.parametrize(
+    "factory,num_experts_modules,scratch_capacity_factor,inplace_wgrad_accum",
+    [
+        (eager_configs.deepseek_v3_debugmodel_dist_moe_bf16, 5, 1.0, True),
+        (eager_configs.deepseek_v3_16b_dist_moe_bf16, 26, 4.0, True),
+        (eager_configs.deepseek_v3_671b_dist_moe_bf16, 58, 4.0, True),
+        (
+            graph_configs.graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16,
+            5,
+            1.0,
+            False,
+        ),
+        (
+            graph_configs.graph_trainer_deepseek_v3_16b_dist_moe_bf16,
+            26,
+            4.0,
+            False,
+        ),
+        (
+            graph_configs.graph_trainer_deepseek_v3_671b_dist_moe_bf16,
+            58,
+            4.0,
+            False,
+        ),
+    ],
+)
+def test_dist_moe_bf16_recipes_use_varlen_and_replace_all_experts(
+    factory, num_experts_modules, scratch_capacity_factor, inplace_wgrad_accum
+):
+    config = factory()
+    model_config = config.model
+    experts = list(model_config.traverse(DistMoeRoutedExperts.Config))
+    runtime = config.dist_moe
+
+    assert len(experts) == num_experts_modules
+    assert all(type(entry[1]) is DistMoeRoutedExperts.Config for entry in experts)
+    assert isinstance(runtime, DistMoeRuntime.Config)
+    assert runtime.vmm_capacity_factor is None
+    assert runtime.scratch_capacity_factor == scratch_capacity_factor
+    assert config.training.mixed_precision_reduce == "bfloat16"
+    assert all(
+        expert.inplace_wgrad_accum is inplace_wgrad_accum for _, expert, _, _ in experts
+    )
+    assert all(
+        isinstance(layer.attention.inner_attention, VarlenInnerAttention.Config)
+        for layer in model_config.layers
+    )
+    assert config.dataloader.max_num_documents == 512
+
+
+def test_eager_dist_moe_recipe_supports_cuda_graphs_with_pipeline_parallelism():
+    """The eager recipe accepts EP and PP while retaining CUDA graphs."""
+    config = eager_configs.deepseek_v3_debugmodel_dist_moe_bf16(seq_len=128)
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+
+    config.model.update_from_config(config=config)
+    config.__post_init__()
+
+
+@pytest.mark.parametrize(
+    "factory,num_experts_modules,scratch_capacity_factor,inplace_wgrad_accum",
+    [
+        (eager_configs.deepseek_v3_debugmodel_dist_moe_mxfp8, 5, 1.0, True),
+        (eager_configs.deepseek_v3_16b_dist_moe_mxfp8, 26, 4.0, True),
+        (eager_configs.deepseek_v3_671b_dist_moe_mxfp8, 58, 4.0, True),
+        (
+            graph_configs.graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8,
+            5,
+            1.0,
+            False,
+        ),
+        (
+            graph_configs.graph_trainer_deepseek_v3_16b_dist_moe_mxfp8,
+            26,
+            4.0,
+            False,
+        ),
+        (
+            graph_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8,
+            58,
+            4.0,
+            False,
+        ),
+    ],
+)
+def test_dist_moe_mxfp8_recipes_quantize_dense_linears_and_lm_head(
+    factory,
+    num_experts_modules,
+    scratch_capacity_factor,
+    inplace_wgrad_accum,
+    monkeypatch,
+):
+    pytest.importorskip("torchao")
+    from torchtitan.quantization import MXFP8Linear
+
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8Linear is unavailable")
+    monkeypatch.setattr(quantization_transform, "has_cuda_capability", lambda *_: True)
+    config = factory()
+    model_config = config.model
+    experts = list(model_config.traverse(DistMoeRoutedExperts.Config))
+    runtime = config.dist_moe
+    linears = {
+        fqn
+        for fqn, _linear, _parent, _attr in model_config.traverse(MXFP8Linear.Config)
+    }
+
+    assert len(experts) == num_experts_modules
+    assert all(
+        isinstance(entry[1], MXFP8DistMoeRoutedExperts.Config) for entry in experts
+    )
+    assert isinstance(runtime, DistMoeRuntime.Config)
+    assert runtime.vmm_capacity_factor is None
+    assert runtime.scratch_capacity_factor == scratch_capacity_factor
+    assert config.training.mixed_precision_reduce == "bfloat16"
+    assert all(
+        expert.inplace_wgrad_accum is inplace_wgrad_accum for _, expert, _, _ in experts
+    )
+    assert "lm_head" in linears

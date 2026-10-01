@@ -7,6 +7,7 @@
 """Configurations for the ``b200`` integration test suite."""
 
 from torchtitan.components.optimizer import AdamW, OptimizersContainer
+from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.trainer import Trainer
 
 from torchtitan_recipes.tests import _set_spmd_typechecking
@@ -97,4 +98,107 @@ def kimi_k3_debugmodel_fsdp2_tp2_ep2_pp2_vpp4() -> Trainer.Config:
     config.optimizer = OptimizersContainer.Config(
         optimizers=[AdamW.Config(pattern=r".*", lr=8e-4)]
     )
+    return config
+
+
+def _configure_dist_moe_fsdp2_ep2(config: Trainer.Config) -> Trainer.Config:
+    """Apply the common two-GPU Dist-MoE integration-test topology."""
+    runtime = config.dist_moe
+    assert isinstance(runtime, DistMoeRuntime.Config)
+    runtime.scratch_capacity_factor = 2.0
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    config.training.num_tokens_per_microbatch_per_dp_rank = 128
+    config.training.max_context_length = 128
+    config.training.steps = 4
+    config.checkpointer = None
+    return config
+
+
+def deepseek_v3_debugmodel_dist_moe_bf16_fsdp2_ep2() -> Trainer.Config:
+    """Exercise BF16 Dist-MoE in-place WGRAD accumulation with FSDP and EP."""
+    from torchtitan.models.deepseek_v3.config_registry import (
+        deepseek_v3_debugmodel_dist_moe_bf16,
+    )
+
+    return _configure_dist_moe_fsdp2_ep2(
+        deepseek_v3_debugmodel_dist_moe_bf16(seq_len=128)
+    )
+
+
+def deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2() -> Trainer.Config:
+    """Exercise MXFP8 Dist-MoE in-place WGRAD accumulation with FSDP and EP."""
+    from torchtitan.models.deepseek_v3.config_registry import (
+        deepseek_v3_debugmodel_dist_moe_mxfp8,
+    )
+
+    return _configure_dist_moe_fsdp2_ep2(
+        deepseek_v3_debugmodel_dist_moe_mxfp8(seq_len=128)
+    )
+
+
+def graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16_fsdp2_ep2() -> Trainer.Config:
+    """Exercise BF16 Dist-MoE in non-pipeline GraphTrainer."""
+    from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
+        graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16,
+    )
+
+    return _configure_dist_moe_fsdp2_ep2(
+        graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16()
+    )
+
+
+def graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2() -> Trainer.Config:
+    """Exercise MXFP8 Dist-MoE in non-pipeline GraphTrainer."""
+    from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
+        graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8,
+    )
+
+    return _configure_dist_moe_fsdp2_ep2(
+        graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8()
+    )
+
+
+def graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2() -> (
+    Trainer.Config
+):
+    """Exercise slot-specialized Dist-MoE graphs in GraphPP."""
+    config = graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2()
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.num_pp_microbatches = 4
+    return config
+
+
+def deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2() -> Trainer.Config:
+    """Exercise schedule-derived Dist-MoE slots in eager pipeline parallelism."""
+    from torchtitan.models.deepseek_v3.config_registry import (
+        deepseek_v3_debugmodel_dist_moe_mxfp8,
+    )
+
+    config = _configure_dist_moe_fsdp2_ep2(
+        deepseek_v3_debugmodel_dist_moe_mxfp8(seq_len=128)
+    )
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.num_pp_microbatches = 4
+    return config
+
+
+def deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2_fp32_reduce() -> (
+    Trainer.Config
+):
+    """Exercise eager PP with BF16 Dist-MoE WGrad and FP32 reduction."""
+    config = deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2()
+    config.training.mixed_precision_reduce = "float32"
+    return config
+
+
+def deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_vmm() -> Trainer.Config:
+    """Exercise host-backed VMM scratch preallocation with MXFP8 Dist-MoE."""
+    config = deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2()
+    runtime = config.dist_moe
+    assert isinstance(runtime, DistMoeRuntime.Config)
+    runtime.scratch_capacity_factor = 1.0
+    runtime.vmm_capacity_factor = 4.0
     return config

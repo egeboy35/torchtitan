@@ -42,4 +42,74 @@ def build_b200_tests_list() -> list[OverrideDefinitions]:
             test_name="nvfp4_linear_fsdp",
             ngpu=2,
         ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_dist_moe_bf16_fsdp2_ep2],
+            test_descr=(
+                "BF16 Dist-MoE in-place WGRAD accumulation with FSDP, EP, "
+                "and CUDA graphs"
+            ),
+            test_name="dist_moe_bf16_fsdp_ep_cudagraph",
+            ngpu=2,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2],
+            test_descr=(
+                "MXFP8 Dist-MoE in-place WGRAD accumulation with FSDP, EP, "
+                "and CUDA graphs"
+            ),
+            test_name="dist_moe_mxfp8_fsdp_ep_cudagraph",
+            ngpu=2,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[
+                recipes.graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16_fsdp2_ep2
+            ],
+            test_descr="BF16 Dist-MoE with non-pipeline GraphTrainer",
+            test_name="graph_trainer_dist_moe_bf16_fsdp_ep",
+            ngpu=2,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[
+                recipes.graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2
+            ],
+            test_descr="MXFP8 Dist-MoE with non-pipeline GraphTrainer",
+            test_name="graph_trainer_dist_moe_mxfp8_fsdp_ep",
+            ngpu=2,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2],
+            test_descr="MXFP8 Dist-MoE with eager PP activation-slot reuse",
+            test_name="dist_moe_mxfp8_fsdp_ep_pp_cudagraph",
+            ngpu=4,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[
+                recipes.deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2_fp32_reduce
+            ],
+            test_descr=("MXFP8 Dist-MoE with eager PP, BF16 WGrad, and FP32 reduction"),
+            test_name="dist_moe_mxfp8_fsdp_ep_pp_fp32_reduce_cudagraph",
+            ngpu=4,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[
+                recipes.graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2
+            ],
+            test_descr="MXFP8 Dist-MoE with GraphPP activation-slot reuse",
+            test_name="graph_trainer_dist_moe_mxfp8_fsdp_ep_pp_cudagraph",
+            ngpu=4,
+            use_real_pg=True,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_vmm],
+            test_descr="MXFP8 Dist-MoE with host-backed VMM scratch preallocation",
+            test_name="dist_moe_mxfp8_fsdp_ep_cudagraph_vmm",
+            ngpu=2,
+            use_real_pg=True,
+        ),
     ]
